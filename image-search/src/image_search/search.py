@@ -71,3 +71,39 @@ def search_text(
         return out
 
     return rows_for(vector_hits, "vector") + rows_for(fts_hits, "fts")
+
+
+def search_similar_images(
+    conn: sqlite3.Connection,
+    config: SearchConfig,
+    folder_key: str,
+    image_id: str,
+    k: int = 20,
+) -> list[SearchHit]:
+    """Reverse-image search (spec section 7.4): given an already-indexed
+    image_id, find its nearest neighbors in the same (space, model)
+    partition. Locked to that one image model — never cross-model cosine."""
+    folder = config.folders[folder_key]
+    image_embed_model = folder.enabled("image_embed")
+    if not image_embed_model:
+        raise ValueError(f"Folder {folder_key!r} has no image_embed configured")
+
+    query_vector = vectors_store.get_vector(conn, "image", image_embed_model, image_id)
+    if query_vector is None:
+        raise ValueError(
+            f"No {image_embed_model!r} image vector stored for image_id={image_id!r} "
+            "(index it first)"
+        )
+
+    # Over-fetch by one since the query image itself is its own nearest neighbor.
+    raw = vectors_store.query_nearest(conn, "image", image_embed_model, query_vector, k=k + 1)
+
+    out = []
+    for iid, dist in raw:
+        if iid == image_id:
+            continue
+        row = conn.execute("SELECT path FROM images WHERE id = ?", (iid,)).fetchone()
+        if row is None:
+            continue
+        out.append(SearchHit(image_id=iid, path=row["path"], score=-dist, source="vector"))
+    return out[:k]

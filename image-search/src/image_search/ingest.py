@@ -5,6 +5,7 @@ import sqlite3
 from image_search.config import SearchConfig
 from image_search.processors.base import (
     CaptionRecord,
+    ImageEmbedRecord,
     LoadedImage,
     OcrRecord,
     TextEmbedRecord,
@@ -65,6 +66,10 @@ def ingest_folder(
                 elif isinstance(record, TextEmbedRecord):
                     vectors_store.insert_vector(
                         conn, "text", record.model, disc.image_id, record.vector
+                    )
+                elif isinstance(record, ImageEmbedRecord):
+                    vectors_store.insert_vector(
+                        conn, "image", record.model, disc.image_id, record.vector
                     )
                 else:
                     raise NotImplementedError(

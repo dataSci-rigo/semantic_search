@@ -64,6 +64,18 @@ conda run -n sem_search_ocr pip install \
   "nvidia-cusparse-cu11==11.7.5.86" "nvidia-nvtx-cu11==11.8.86"
 ```
 
+## Phase 2 addendum: cuDNN conv2d is broken on this GPU too
+
+`SiglipImageEmbedProcessor` (image embeddings) hits a *different* Pascal
+issue: cuDNN 9's conv2d algorithm search fails outright on `sm_61` —
+`RuntimeError: GET was unable to find an engine to execute this computation`.
+This isn't a missing-kernel error like the CUDA-13 case above; cuDNN 9 itself
+can't find a working convolution algorithm for this architecture. Fix:
+`torch.backends.cudnn.enabled = False` before loading the model, which forces
+torch's native (non-cuDNN) conv kernels — slower, but correct. Harmless to set
+process-wide even though `sentence-transformers` shares the process: BERT-style
+text models are attention/matmul-only, no conv2d, so they're unaffected.
+
 ## If the GPU ever changes
 
 If this moves to a Volta/Turing-or-newer card (compute capability >= 7.0),

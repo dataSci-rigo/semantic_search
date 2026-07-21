@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import struct
 
 from image_search.store.db import load_vec_extension
 
@@ -43,6 +44,37 @@ def insert_vector(
         (table, cur.lastrowid, image_id),
     )
     conn.commit()
+
+
+def get_vector(
+    conn: sqlite3.Connection, space: Space, model: str, image_id: str
+) -> list[float] | None:
+    """Fetch the stored vector for one image_id within a (space, model)
+    partition, e.g. to drive reverse-image search from an already-indexed
+    image rather than re-embedding it."""
+    table = vec_table_name(space, model)
+    load_vec_extension(conn)
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not exists:
+        return None
+    row = conn.execute(
+        f"""
+        SELECT v.embedding AS embedding
+        FROM vec_map vm
+        JOIN {table} v ON v.rowid = vm.rowid
+        WHERE vm.vec_table = ? AND vm.image_id = ?
+        """,
+        (table, image_id),
+    ).fetchone()
+    if row is None:
+        return None
+    # vec0 returns the embedding column as packed float32 bytes, not JSON
+    # (only INSERT accepts the JSON-text form).
+    raw = row["embedding"]
+    count = len(raw) // 4
+    return list(struct.unpack(f"<{count}f", raw))
 
 
 def query_nearest(

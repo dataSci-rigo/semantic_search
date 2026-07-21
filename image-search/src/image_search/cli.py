@@ -8,7 +8,8 @@ from pathlib import Path
 from image_search.config import load_config
 from image_search.ingest import ingest_all
 from image_search.registry import Registry
-from image_search.search import search_text
+from image_search.search import search_similar_images, search_text
+from image_search.store import images as images_store
 from image_search.store.db import connect, migrate
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "folders.yaml"
@@ -39,6 +40,16 @@ def cmd_search(args: argparse.Namespace) -> None:
         print(f"{hit.score:.4f}\t{hit.source}\t{hit.path}")
 
 
+def cmd_similar(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    conn = connect(args.db)
+    migrate(conn)
+    image_id = images_store.content_hash(Path(args.image))
+    hits = search_similar_images(conn, config, args.folder, image_id, k=args.k)
+    for hit in hits:
+        print(f"{hit.score:.4f}\t{hit.path}")
+
+
 def cmd_cluster(args: argparse.Namespace) -> None:
     raise NotImplementedError("Face clustering lands in Phase 5 of the build spec.")
 
@@ -61,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("query")
     p_search.add_argument("-k", type=int, default=20)
     p_search.set_defaults(func=cmd_search)
+
+    p_similar = sub.add_parser("similar", help="Reverse-image search: find visually similar images")
+    p_similar.add_argument("folder", help="Folder key from folders.yaml to search within")
+    p_similar.add_argument("image", help="Path to an already-indexed image")
+    p_similar.add_argument("-k", type=int, default=20)
+    p_similar.set_defaults(func=cmd_similar)
 
     p_cluster = sub.add_parser("cluster", help="Re-cluster faces (not implemented yet)")
     p_cluster.set_defaults(func=cmd_cluster)
