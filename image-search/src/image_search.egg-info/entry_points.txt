@@ -1,0 +1,2 @@
+[console_scripts]
+image-search = image_search.cli:main

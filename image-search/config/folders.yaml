@@ -1,0 +1,11 @@
+defaults:
+  text_embed: bge-small-en-v1.5
+  image_embed: siglip2-base
+  face_model: buffalo_l
+  face_detect: scrfd_10g
+
+folders:
+  "~/Screenshots":
+    ocr: rapidocr
+    text_embed: bge-small-en-v1.5
+    faces: off
