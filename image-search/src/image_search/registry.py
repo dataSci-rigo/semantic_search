@@ -10,6 +10,7 @@ _CONSTRUCTORS: dict[str, type] = {}
 
 def _lazy_constructors() -> dict[str, type]:
     if not _CONSTRUCTORS:
+        from image_search.processors.caption import MoondreamCaptionProcessor
         from image_search.processors.image_embed import SiglipImageEmbedProcessor
         from image_search.processors.ocr import RapidOcrProcessor
         from image_search.processors.text_embed import SentenceTransformerProcessor
@@ -17,6 +18,7 @@ def _lazy_constructors() -> dict[str, type]:
         _CONSTRUCTORS["ocr"] = RapidOcrProcessor
         _CONSTRUCTORS["text_embed"] = SentenceTransformerProcessor
         _CONSTRUCTORS["image_embed"] = SiglipImageEmbedProcessor
+        _CONSTRUCTORS["caption"] = MoondreamCaptionProcessor
     return _CONSTRUCTORS
 
 

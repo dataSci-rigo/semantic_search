@@ -6,6 +6,7 @@ from PIL import Image
 from image_search.config import load_config
 from image_search.ingest import ingest_folder
 from image_search.processors.base import (
+    CaptionRecord,
     ImageEmbedRecord,
     LoadedImage,
     OcrRecord,
@@ -55,13 +56,31 @@ class FakeImageEmbed:
         return [ImageEmbedRecord(model=self.model_id, vector=[1.0, 0.0, 0.0])]
 
 
-def make_config(tmp_path, folder, with_text_embed=True, with_image_embed=False):
+class FakeCaption:
+    kind = "caption"
+    model_id = "fake-caption"
+
+    def load(self) -> None:
+        pass
+
+    def process(self, img: LoadedImage) -> list[Record]:
+        return [CaptionRecord(text=f"a photo, id {img.image_id[:8]}")]
+
+
+def make_config(
+    tmp_path,
+    folder,
+    with_ocr=True,
+    with_text_embed=True,
+    with_image_embed=False,
+    with_caption=False,
+):
     config_path = tmp_path / "folders.yaml"
-    lines = [
-        "folders:",
-        f'  "{folder}":',
-        "    ocr: fake-ocr",
-    ]
+    lines = ["folders:", f'  "{folder}":']
+    if with_ocr:
+        lines.append("    ocr: fake-ocr")
+    if with_caption:
+        lines.append("    caption: fake-caption")
     if with_text_embed:
         lines.append("    text_embed: fake-embed")
     if with_image_embed:
@@ -75,6 +94,7 @@ def fake_registry(config):
     registry._instances[("ocr", "fake-ocr")] = FakeOcr()
     registry._instances[("text_embed", "fake-embed")] = FakeTextEmbed()
     registry._instances[("image_embed", "fake-image-embed")] = FakeImageEmbed()
+    registry._instances[("caption", "fake-caption")] = FakeCaption()
     return registry
 
 
@@ -177,3 +197,35 @@ def test_ingest_writes_image_embed_vector_to_its_own_space(tmp_path):
         "vec_text__fake_embed": 1,
         "vec_image__fake_image_embed": 1,
     }
+
+
+def test_ingest_caption_feeds_text_embed_without_ocr(tmp_path):
+    """Phase 3 criterion: an image with no OCR text is still retrievable by
+    its captioned content — caption output must flow into text_embed the
+    same way OCR output does."""
+    pytest.importorskip("sqlite_vec", reason="requires sqlite-vec (Phase 1 dependency)")
+
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    Image.new("RGB", (4, 4)).save(folder / "one.png")
+
+    config = make_config(tmp_path, str(folder), with_ocr=False, with_caption=True)
+    registry = fake_registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    stats = ingest_folder(conn, config, registry, str(folder))
+    assert stats == {"seen": 1, "skipped": 0, "indexed": 1}
+
+    assert conn.execute("SELECT COUNT(*) AS n FROM ocr_text").fetchone()["n"] == 0
+
+    caption_rows = conn.execute("SELECT text FROM captions").fetchall()
+    assert len(caption_rows) == 1
+    assert caption_rows[0]["text"].startswith("a photo")
+
+    fts_rows = conn.execute("SELECT * FROM text_fts").fetchall()
+    assert len(fts_rows) == 1
+
+    vec_rows = conn.execute("SELECT COUNT(*) AS n FROM vec_map").fetchone()
+    assert vec_rows["n"] == 1
