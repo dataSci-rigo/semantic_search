@@ -15,7 +15,10 @@ text = [
     "sqlite-vec>=0.1.0",
     "sentence-transformers>=3.0.0",
 ]
-# Phase 2+: image embedding, captioning, tagging, faces, layout (not built yet)
+# Phase 2: image embedding (SigLIP2, via `transformers`, already covers `text`'s deps).
+# Phase 3: captioning also runs out-of-process, in `sem_search_caption`
+# (see docs/gpu-setup.md) — its deps (older `transformers`) are NOT installed here.
+# Phase 4+: tagging, faces, layout (not built yet)
 full = [
     "image-search[text]",
 ]
