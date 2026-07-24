@@ -43,13 +43,17 @@ class Registry:
             self._instances[key] = constructors[kind](model_id)
         return self._instances[key]
 
-    def for_folder(self, folder_key: str) -> list[tuple[str, Processor]]:
-        """Processors enabled for a folder, in dispatch order (PROCESSOR_KEYS
-        already orders text producers before text_embed)."""
-        folder = self._config.folders[folder_key]
+    def for_processors(self, processors: dict[str, str]) -> list[tuple[str, Processor]]:
+        """Resolve a processors dict (kind -> model_id) to instances, in
+        dispatch order (PROCESSOR_KEYS already orders text producers before
+        text_embed)."""
         out = []
         for kind in PROCESSOR_KEYS:
-            model_id = folder.enabled(kind)
+            model_id = processors.get(kind)
             if model_id:
                 out.append((kind, self.get(kind, model_id)))
         return out
+
+    def for_folder(self, folder_key: str) -> list[tuple[str, Processor]]:
+        """Processors enabled for a folder's base (non-override) pipeline."""
+        return self.for_processors(self._config.folders[folder_key].processors)

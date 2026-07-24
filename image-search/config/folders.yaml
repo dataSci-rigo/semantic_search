@@ -5,7 +5,13 @@ defaults:
   face_detect: scrfd_10g
 
 folders:
-  "~/Screenshots":
-    ocr: rapidocr
-    text_embed: bge-small-en-v1.5
-    faces: off
+  # Whole photo library. Nested "Screenshots" dirs (there are several,
+  # scattered under dw2/, pix3/, pix3/Pictures/, and the top-level one) get
+  # OCR instead of caption/image_embed via the path override below — see
+  # config.py:FolderConfig.processors_for_path.
+  "~/Pictures":
+    caption: moondream2
+    image_embed: siglip2-base
+    overrides:
+      Screenshots:
+        ocr: rapidocr

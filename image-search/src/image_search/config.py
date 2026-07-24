@@ -24,9 +24,20 @@ PROCESSOR_KEYS = (
 class FolderConfig:
     path: Path
     processors: dict[str, str]  # kind -> model_id, "off"/absent entries excluded
+    # dir name (case-insensitive) -> processors, for subtrees that need a
+    # different pipeline than their siblings (e.g. nested "Screenshots" dirs
+    # scattered inside otherwise-photo folders).
+    overrides: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def enabled(self, kind: str) -> str | None:
         return self.processors.get(kind)
+
+    def processors_for_path(self, file_path: Path) -> dict[str, str]:
+        parts_lower = {p.lower() for p in file_path.parts}
+        for name, processors in self.overrides.items():
+            if name.lower() in parts_lower:
+                return processors
+        return self.processors
 
 
 @dataclass(frozen=True)
@@ -34,10 +45,13 @@ class SearchConfig:
     folders: dict[str, FolderConfig] = field(default_factory=dict)
 
     def active_processors(self) -> set[tuple[str, str]]:
-        """Union of (kind, model_id) referenced by any active folder."""
+        """Union of (kind, model_id) referenced by any active folder,
+        including path overrides."""
         out: set[tuple[str, str]] = set()
         for folder in self.folders.values():
             out.update(folder.processors.items())
+            for override_processors in folder.overrides.values():
+                out.update(override_processors.items())
         return out
 
 
@@ -46,6 +60,21 @@ def _is_off(value: object) -> bool:
     if value is None or value is False:
         return True
     return isinstance(value, str) and value.strip().lower() == "off"
+
+
+def _parse_processors(block: dict, defaults: dict[str, str]) -> dict[str, str]:
+    processors: dict[str, str] = {}
+    for key in PROCESSOR_KEYS:
+        if key in block:
+            value = block[key]
+        elif key in defaults:
+            value = defaults[key]
+        else:
+            continue
+        if _is_off(value):
+            continue
+        processors[key] = value
+    return processors
 
 
 def load_config(path: str | Path) -> SearchConfig:
@@ -58,21 +87,18 @@ def load_config(path: str | Path) -> SearchConfig:
     folders: dict[str, FolderConfig] = {}
     for folder_key, folder_raw in raw_folders.items():
         folder_raw = folder_raw or {}
-        processors: dict[str, str] = {}
-        for key in PROCESSOR_KEYS:
-            if key in folder_raw:
-                value = folder_raw[key]
-            elif key in defaults:
-                value = defaults[key]
-            else:
-                continue
-            if _is_off(value):
-                continue
-            processors[key] = value
+        processors = _parse_processors(folder_raw, defaults)
+
+        overrides_raw: dict[str, dict] = folder_raw.get("overrides", {}) or {}
+        overrides = {
+            name: _parse_processors(block or {}, defaults)
+            for name, block in overrides_raw.items()
+        }
 
         folders[folder_key] = FolderConfig(
             path=Path(folder_key).expanduser(),
             processors=processors,
+            overrides=overrides,
         )
 
     config = SearchConfig(folders=folders)

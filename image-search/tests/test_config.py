@@ -1,4 +1,5 @@
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -89,4 +90,69 @@ def test_active_processors_union(tmp_path):
     assert config.active_processors() == {
         ("ocr", "paddle-ppocrv5"),
         ("text_embed", "bge-small-en-v1.5"),
+    }
+
+
+def test_path_override_used_for_matching_subtree(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        defaults:
+          text_embed: bge-small-en-v1.5
+        folders:
+          "~/Pictures":
+            caption: moondream2
+            overrides:
+              Screenshots:
+                ocr: rapidocr
+        """,
+    )
+    config = load_config(path)
+    folder = config.folders["~/Pictures"]
+
+    assert folder.processors_for_path(Path("~/Pictures/dw2/photo.jpg")) == {
+        "caption": "moondream2",
+        "text_embed": "bge-small-en-v1.5",
+    }
+    assert folder.processors_for_path(Path("~/Pictures/dw2/Screenshots/shot.png")) == {
+        "ocr": "rapidocr",
+        "text_embed": "bge-small-en-v1.5",
+    }
+
+
+def test_path_override_match_is_case_insensitive(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        folders:
+          "~/Pictures":
+            caption: moondream2
+            overrides:
+              Screenshots:
+                ocr: rapidocr
+        """,
+    )
+    config = load_config(path)
+    folder = config.folders["~/Pictures"]
+    assert folder.processors_for_path(Path("~/Pictures/screenshots/shot.png")) == {
+        "ocr": "rapidocr"
+    }
+
+
+def test_active_processors_includes_overrides(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        folders:
+          "~/Pictures":
+            caption: moondream2
+            overrides:
+              Screenshots:
+                ocr: rapidocr
+        """,
+    )
+    config = load_config(path)
+    assert config.active_processors() == {
+        ("caption", "moondream2"),
+        ("ocr", "rapidocr"),
     }

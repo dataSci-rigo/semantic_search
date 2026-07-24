@@ -22,7 +22,6 @@ def ingest_folder(
     enabled processors in order, and persist records. Returns counts."""
     folder = config.folders[folder_key]
     discovered = images_store.discover(folder.path, folder_key)
-    processors = registry.for_folder(folder_key)
 
     stats = {"seen": len(discovered), "skipped": 0, "indexed": 0}
 
@@ -32,6 +31,10 @@ def ingest_folder(
             continue
 
         images_store.upsert_image(conn, disc)
+
+        # Path overrides (e.g. nested "Screenshots" dirs) let one folder
+        # entry route different subtrees through different pipelines.
+        processors = registry.for_processors(folder.processors_for_path(disc.path))
 
         accumulated_text = ""
         for kind, processor in processors:

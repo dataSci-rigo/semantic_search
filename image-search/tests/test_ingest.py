@@ -229,3 +229,39 @@ def test_ingest_caption_feeds_text_embed_without_ocr(tmp_path):
 
     vec_rows = conn.execute("SELECT COUNT(*) AS n FROM vec_map").fetchone()
     assert vec_rows["n"] == 1
+
+
+def test_ingest_routes_by_path_override(tmp_path):
+    """A file under a nested "Screenshots" dir gets the override pipeline
+    (OCR); a sibling file outside it gets the folder's base pipeline
+    (caption) — both under one folder config, one ingest_folder call."""
+    folder = tmp_path / "shots"
+    (folder / "Screenshots").mkdir(parents=True)
+    # Distinct pixel content so the two files don't collide on content-hash id.
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(folder / "photo.png")
+    Image.new("RGB", (4, 4), (0, 255, 0)).save(folder / "Screenshots" / "shot.png")
+
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            folders:
+              "{folder}":
+                caption: fake-caption
+                overrides:
+                  Screenshots:
+                    ocr: fake-ocr
+            """
+        )
+    )
+    config = load_config(config_path)
+    registry = fake_registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    stats = ingest_folder(conn, config, registry, str(folder))
+    assert stats == {"seen": 2, "skipped": 0, "indexed": 2}
+
+    assert conn.execute("SELECT COUNT(*) AS n FROM captions").fetchone()["n"] == 1
+    assert conn.execute("SELECT COUNT(*) AS n FROM ocr_text").fetchone()["n"] == 1
