@@ -18,19 +18,36 @@ from image_search.store import vectors as vectors_store
 def ingest_folder(
     conn: sqlite3.Connection, config: SearchConfig, registry: Registry, folder_key: str
 ) -> dict[str, int]:
-    """Discover files in one configured folder, skip unchanged ones, dispatch
-    enabled processors in order, and persist records. Returns counts."""
+    """Incrementally index one configured folder.
+
+    Freshness is tracked per *path* (files table: stat-only skip for unchanged
+    mtimes, no re-hashing), while processing happens once per *content id* —
+    renames, metadata-only touches, and byte-identical duplicate copies never
+    reprocess or duplicate derived records. Content no path references anymore
+    is purged at the end. Returns counts."""
     folder = config.folders[folder_key]
-    discovered = images_store.discover(folder.path, folder_key)
+    walked = images_store.walk_images(folder.path)
+    known = images_store.load_file_state(conn, folder_key)
 
-    stats = {"seen": len(discovered), "skipped": 0, "indexed": 0}
+    stats = {"seen": len(walked), "skipped": 0, "indexed": 0, "pruned": 0}
+    seen_paths: set[str] = set()
 
-    for disc in discovered:
-        if images_store.is_unchanged(conn, disc.image_id, disc.mtime):
+    for path, mtime in walked:
+        path_str = str(path)
+        seen_paths.add(path_str)
+        prior = known.get(path_str)
+        if prior is not None and prior[1] == mtime:
             stats["skipped"] += 1
             continue
 
-        images_store.upsert_image(conn, disc)
+        disc = images_store.describe(path, folder_key, mtime)
+        images_store.upsert_file(conn, path_str, folder_key, disc.image_id, mtime)
+        if images_store.is_indexed(conn, disc.image_id):
+            # Same content already processed under another path (duplicate
+            # copy), a rename, or a metadata-only touch — nothing to redo.
+            conn.commit()
+            stats["skipped"] += 1
+            continue
 
         # Path overrides (e.g. nested "Screenshots" dirs) let one folder
         # entry route different subtrees through different pipelines.
@@ -79,9 +96,16 @@ def ingest_folder(
                         f"ingest does not yet handle record type {type(record).__name__}"
                     )
 
+        # Written only after every processor succeeded: the images row is the
+        # done-marker is_indexed checks, and the per-image commit below makes
+        # each image all-or-nothing (a crash mid-image rolls back its files
+        # row too, so the next run retries it).
+        images_store.upsert_image(conn, disc)
         conn.commit()
         stats["indexed"] += 1
 
+    stats["pruned"] = images_store.prune_missing(conn, folder_key, seen_paths)
+    conn.commit()
     return stats
 
 

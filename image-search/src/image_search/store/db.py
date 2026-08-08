@@ -15,6 +15,19 @@ CREATE TABLE IF NOT EXISTS images (
   indexed_at   REAL
 );
 
+-- Per-path freshness state. images is keyed by content hash (so duplicate
+-- copies and renames share one processed row); files tracks which on-disk
+-- paths exist and their last-seen mtime, so ingest can stat-skip unchanged
+-- paths without re-hashing and can prune content no path references anymore.
+CREATE TABLE IF NOT EXISTS files (
+  path     TEXT PRIMARY KEY,
+  folder   TEXT NOT NULL,
+  image_id TEXT NOT NULL,
+  mtime    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_files_image_id ON files(image_id);
+CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder);
+
 -- FREE outputs: text. Multiple models may coexist (model column).
 CREATE TABLE IF NOT EXISTS ocr_text (image_id TEXT, model TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS captions (image_id TEXT, model TEXT, text TEXT);

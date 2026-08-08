@@ -28,13 +28,14 @@ def ensure_vec_table(conn: sqlite3.Connection, space: Space, model: str, dim: in
     conn.execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(embedding float[{dim}])"
     )
-    conn.commit()
     return table
 
 
 def insert_vector(
     conn: sqlite3.Connection, space: Space, model: str, image_id: str, vector: list[float]
 ) -> None:
+    """Insert one vector. Does not commit — the caller owns the transaction
+    (ingest groups all of an image's records into one commit)."""
     table = ensure_vec_table(conn, space, model, dim=len(vector))
     cur = conn.execute(
         f"INSERT INTO {table} (embedding) VALUES (?)", (json.dumps(vector),)
@@ -43,7 +44,21 @@ def insert_vector(
         "INSERT INTO vec_map (vec_table, rowid, image_id) VALUES (?, ?, ?)",
         (table, cur.lastrowid, image_id),
     )
-    conn.commit()
+
+
+def delete_vectors(conn: sqlite3.Connection, image_id: str) -> int:
+    """Remove every stored vector for an image_id across all (space, model)
+    partitions, via the vec_map sidecar. Returns the number removed."""
+    rows = conn.execute(
+        "SELECT vec_table, rowid AS r FROM vec_map WHERE image_id = ?", (image_id,)
+    ).fetchall()
+    if not rows:
+        return 0
+    load_vec_extension(conn)
+    for row in rows:
+        conn.execute(f'DELETE FROM {row["vec_table"]} WHERE rowid = ?', (row["r"],))
+    conn.execute("DELETE FROM vec_map WHERE image_id = ?", (image_id,))
+    return len(rows)
 
 
 def get_vector(
@@ -98,6 +113,7 @@ def query_nearest(
             ORDER BY distance
         ) v
         JOIN vec_map vm ON vm.vec_table = ? AND vm.rowid = v.rowid
+        ORDER BY v.distance
         """,
         (json.dumps(vector), k, table),
     ).fetchall()

@@ -50,6 +50,35 @@ def cmd_similar(args: argparse.Namespace) -> None:
         print(f"{hit.score:.4f}\t{hit.path}")
 
 
+def cmd_dupes(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    migrate(conn)
+    groups = images_store.duplicate_groups(conn)
+    if not groups:
+        print("No duplicate files in the index.")
+        return
+    total = sum(len(paths) - 1 for _, paths in groups)
+    for image_id, paths in groups:
+        print(f"{image_id[:12]}  keep  {paths[0]}")
+        for extra in paths[1:]:
+            print(f"{'':12}  dup   {extra}")
+    if not args.delete:
+        print(
+            f"\n{total} duplicate file(s) in {len(groups)} group(s). "
+            "Re-run with --delete to remove them from disk "
+            "(keeps the first path in each group)."
+        )
+        return
+    deleted = 0
+    for _, paths in groups:
+        for extra in paths[1:]:
+            Path(extra).unlink(missing_ok=True)
+            conn.execute("DELETE FROM files WHERE path = ?", (extra,))
+            deleted += 1
+    conn.commit()
+    print(f"\nDeleted {deleted} duplicate file(s); kept one copy per group.")
+
+
 def cmd_cluster(args: argparse.Namespace) -> None:
     raise NotImplementedError("Face clustering lands in Phase 5 of the build spec.")
 
@@ -78,6 +107,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_similar.add_argument("image", help="Path to an already-indexed image")
     p_similar.add_argument("-k", type=int, default=20)
     p_similar.set_defaults(func=cmd_similar)
+
+    p_dupes = sub.add_parser(
+        "dupes", help="List duplicate files (same content under multiple paths)"
+    )
+    p_dupes.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete all but the first path in each group — removes files from disk!",
+    )
+    p_dupes.set_defaults(func=cmd_dupes)
 
     p_cluster = sub.add_parser("cluster", help="Re-cluster faces (not implemented yet)")
     p_cluster.set_defaults(func=cmd_cluster)

@@ -111,7 +111,7 @@ def test_ingest_writes_ocr_and_fts_without_text_embed(tmp_path):
     migrate(conn)
 
     stats = ingest_folder(conn, config, registry, str(folder))
-    assert stats == {"seen": 1, "skipped": 0, "indexed": 1}
+    assert stats == {"seen": 1, "skipped": 0, "indexed": 1, "pruned": 0}
 
     ocr_rows = conn.execute("SELECT text FROM ocr_text").fetchall()
     assert len(ocr_rows) == 1
@@ -138,7 +138,7 @@ def test_ingest_writes_ocr_text_and_vector(tmp_path):
     migrate(conn)
 
     stats = ingest_folder(conn, config, registry, str(folder))
-    assert stats == {"seen": 1, "skipped": 0, "indexed": 1}
+    assert stats == {"seen": 1, "skipped": 0, "indexed": 1, "pruned": 0}
 
     ocr_rows = conn.execute("SELECT text FROM ocr_text").fetchall()
     assert len(ocr_rows) == 1
@@ -189,7 +189,7 @@ def test_ingest_writes_image_embed_vector_to_its_own_space(tmp_path):
     migrate(conn)
 
     stats = ingest_folder(conn, config, registry, str(folder))
-    assert stats == {"seen": 1, "skipped": 0, "indexed": 1}
+    assert stats == {"seen": 1, "skipped": 0, "indexed": 1, "pruned": 0}
 
     rows = conn.execute("SELECT vec_table, COUNT(*) AS n FROM vec_map GROUP BY vec_table").fetchall()
     tables = {r["vec_table"]: r["n"] for r in rows}
@@ -216,7 +216,7 @@ def test_ingest_caption_feeds_text_embed_without_ocr(tmp_path):
     migrate(conn)
 
     stats = ingest_folder(conn, config, registry, str(folder))
-    assert stats == {"seen": 1, "skipped": 0, "indexed": 1}
+    assert stats == {"seen": 1, "skipped": 0, "indexed": 1, "pruned": 0}
 
     assert conn.execute("SELECT COUNT(*) AS n FROM ocr_text").fetchone()["n"] == 0
 
@@ -261,7 +261,145 @@ def test_ingest_routes_by_path_override(tmp_path):
     migrate(conn)
 
     stats = ingest_folder(conn, config, registry, str(folder))
-    assert stats == {"seen": 2, "skipped": 0, "indexed": 2}
+    assert stats == {"seen": 2, "skipped": 0, "indexed": 2, "pruned": 0}
 
     assert conn.execute("SELECT COUNT(*) AS n FROM captions").fetchone()["n"] == 1
     assert conn.execute("SELECT COUNT(*) AS n FROM ocr_text").fetchone()["n"] == 1
+
+
+def _counts(conn, *tables):
+    return {t: conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"] for t in tables}
+
+
+def test_touch_rerun_does_not_duplicate(tmp_path):
+    """A metadata-only mtime change must not reprocess or duplicate records."""
+    import os
+
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    img_path = folder / "one.png"
+    Image.new("RGB", (4, 4)).save(img_path)
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    os.utime(img_path, (img_path.stat().st_atime, img_path.stat().st_mtime + 5))
+    second = ingest_folder(conn, config, registry, str(folder))
+
+    assert second == {"seen": 1, "skipped": 1, "indexed": 0, "pruned": 0}
+    assert _counts(conn, "ocr_text", "text_fts") == {"ocr_text": 1, "text_fts": 1}
+
+
+def test_duplicate_content_processed_once(tmp_path):
+    """Byte-identical copies share one content id: processed once, and reruns
+    stay quiet instead of flip-flopping on mtime forever."""
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(folder / "one.png")
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(folder / "copy.png")
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    first = ingest_folder(conn, config, registry, str(folder))
+    assert first == {"seen": 2, "skipped": 1, "indexed": 1, "pruned": 0}
+    assert _counts(conn, "images", "ocr_text", "text_fts") == {
+        "images": 1, "ocr_text": 1, "text_fts": 1,
+    }
+
+    second = ingest_folder(conn, config, registry, str(folder))
+    assert second == {"seen": 2, "skipped": 2, "indexed": 0, "pruned": 0}
+    assert _counts(conn, "ocr_text")["ocr_text"] == 1
+
+
+def test_deleted_file_is_pruned(tmp_path):
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(folder / "keep.png")
+    Image.new("RGB", (4, 4), (0, 255, 0)).save(folder / "gone.png")
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    (folder / "gone.png").unlink()
+    second = ingest_folder(conn, config, registry, str(folder))
+
+    assert second == {"seen": 1, "skipped": 1, "indexed": 0, "pruned": 1}
+    assert _counts(conn, "images", "ocr_text", "text_fts", "files") == {
+        "images": 1, "ocr_text": 1, "text_fts": 1, "files": 1,
+    }
+
+
+def test_deleting_one_duplicate_copy_keeps_content(tmp_path):
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(folder / "one.png")
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(folder / "copy.png")
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    (folder / "copy.png").unlink()
+    second = ingest_folder(conn, config, registry, str(folder))
+
+    # The other path still references this content: nothing purged.
+    assert second["pruned"] == 0
+    assert _counts(conn, "images", "ocr_text") == {"images": 1, "ocr_text": 1}
+
+
+def test_edited_file_reindexes_and_prunes_old_content(tmp_path):
+    import os
+
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    img_path = folder / "one.png"
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(img_path)
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    old_id = conn.execute("SELECT id FROM images").fetchone()["id"]
+
+    Image.new("RGB", (4, 4), (0, 0, 255)).save(img_path)  # new bytes, new hash
+    os.utime(img_path, (img_path.stat().st_atime, img_path.stat().st_mtime + 5))
+    second = ingest_folder(conn, config, registry, str(folder))
+
+    assert second == {"seen": 1, "skipped": 0, "indexed": 1, "pruned": 1}
+    rows = conn.execute("SELECT id FROM images").fetchall()
+    assert len(rows) == 1 and rows[0]["id"] != old_id
+    assert _counts(conn, "ocr_text", "text_fts") == {"ocr_text": 1, "text_fts": 1}
+
+
+def test_deleted_file_prunes_vectors(tmp_path):
+    pytest.importorskip("sqlite_vec", reason="requires sqlite-vec (Phase 1 dependency)")
+
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(folder / "keep.png")
+    Image.new("RGB", (4, 4), (0, 255, 0)).save(folder / "gone.png")
+
+    config = make_config(tmp_path, str(folder))
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    assert _counts(conn, "vec_map")["vec_map"] == 2
+
+    (folder / "gone.png").unlink()
+    ingest_folder(conn, config, registry, str(folder))
+    assert _counts(conn, "vec_map")["vec_map"] == 1

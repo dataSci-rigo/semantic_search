@@ -62,7 +62,14 @@ def _is_off(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "off"
 
 
-def _parse_processors(block: dict, defaults: dict[str, str]) -> dict[str, str]:
+def _parse_processors(block: dict, defaults: dict[str, str], context: str) -> dict[str, str]:
+    unknown = set(block) - set(PROCESSOR_KEYS) - {"overrides"}
+    if unknown:
+        warnings.warn(
+            f"Unknown processor keys {sorted(unknown)} in {context} are ignored "
+            f"(known kinds: {', '.join(PROCESSOR_KEYS)})",
+            stacklevel=3,
+        )
     processors: dict[str, str] = {}
     for key in PROCESSOR_KEYS:
         if key in block:
@@ -73,6 +80,11 @@ def _parse_processors(block: dict, defaults: dict[str, str]) -> dict[str, str]:
             continue
         if _is_off(value):
             continue
+        if not isinstance(value, str):
+            raise ValueError(
+                f"Processor {key!r} in {context} must be a model id string or 'off', "
+                f"got {value!r} (YAML parses bare on/yes/true as booleans)"
+            )
         processors[key] = value
     return processors
 
@@ -84,14 +96,24 @@ def load_config(path: str | Path) -> SearchConfig:
     defaults: dict[str, str] = raw.get("defaults", {}) or {}
     raw_folders: dict[str, dict] = raw.get("folders", {}) or {}
 
+    unknown_defaults = set(defaults) - set(PROCESSOR_KEYS)
+    if unknown_defaults:
+        warnings.warn(
+            f"Unknown processor keys {sorted(unknown_defaults)} in defaults are ignored "
+            f"(known kinds: {', '.join(PROCESSOR_KEYS)})",
+            stacklevel=2,
+        )
+
     folders: dict[str, FolderConfig] = {}
     for folder_key, folder_raw in raw_folders.items():
         folder_raw = folder_raw or {}
-        processors = _parse_processors(folder_raw, defaults)
+        processors = _parse_processors(folder_raw, defaults, f"folder {folder_key!r}")
 
         overrides_raw: dict[str, dict] = folder_raw.get("overrides", {}) or {}
         overrides = {
-            name: _parse_processors(block or {}, defaults)
+            name: _parse_processors(
+                block or {}, defaults, f"override {name!r} of folder {folder_key!r}"
+            )
             for name, block in overrides_raw.items()
         }
 

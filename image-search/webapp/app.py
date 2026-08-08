@@ -41,10 +41,18 @@ _registry = Registry(_config)
 
 # So the web app can start (and show "no results yet") even before the
 # indexer has run for the first time, instead of erroring on missing tables.
-migrate(connect(DB_PATH))
-# This is the only folder in the real config today (see config/folders.yaml);
-# a multi-folder library would need a folder selector in the UI/API.
-_folder_key = next(iter(_config.folders))
+_boot_conn = connect(DB_PATH)
+migrate(_boot_conn)
+_boot_conn.close()
+_folder_keys = list(_config.folders)
+
+
+def _folder_from_request() -> str:
+    """Folder key from ?folder=, defaulting to the first configured folder."""
+    folder = request.args.get("folder", "").strip() or _folder_keys[0]
+    if folder not in _config.folders:
+        abort(400, f"unknown folder {folder!r}")
+    return folder
 
 
 def _db():
@@ -65,24 +73,29 @@ def _hit_to_dict(hit: SearchHit) -> dict:
 @app.route("/")
 def index():
     query = request.args.get("q", "").strip()
+    folder = _folder_from_request()
     hits: list[SearchHit] = []
     error = None
     if query:
         conn = _db()
         try:
-            hits = search_text(conn, _config, _registry, _folder_key, query, k=40)
+            hits = search_text(conn, _config, _registry, folder, query, k=40)
         except Exception as exc:  # noqa: BLE001 - surface to the page, don't 500
             error = str(exc)
         finally:
             conn.close()
-    return render_template("index.html", query=query, hits=hits, error=error)
+    return render_template(
+        "index.html", query=query, hits=hits, error=error,
+        folders=_folder_keys, folder=folder,
+    )
 
 
 @app.route("/similar/<image_id>")
 def similar(image_id: str):
+    folder = _folder_from_request()
     conn = _db()
     try:
-        hits = search_similar_images(conn, _config, _folder_key, image_id, k=40)
+        hits = search_similar_images(conn, _config, folder, image_id, k=40)
         error = None
     except ValueError as exc:
         hits = []
@@ -90,7 +103,8 @@ def similar(image_id: str):
     finally:
         conn.close()
     return render_template(
-        "index.html", query=f"(similar to {image_id[:8]})", hits=hits, error=error
+        "index.html", query=f"(similar to {image_id[:8]})", hits=hits, error=error,
+        folders=_folder_keys, folder=folder,
     )
 
 
@@ -99,13 +113,22 @@ def api_search():
     query = request.args.get("q", "").strip()
     if not query:
         return jsonify({"ok": False, "error": "missing ?q="}), 400
-    k = int(request.args.get("k", 10))
+    folder = _folder_from_request()
+    try:
+        k = int(request.args.get("k", 10))
+    except ValueError:
+        return jsonify({"ok": False, "error": "k must be an integer"}), 400
+    k = max(1, min(100, k))
     conn = _db()
     try:
-        hits = search_text(conn, _config, _registry, _folder_key, query, k=k)
+        hits = search_text(conn, _config, _registry, folder, query, k=k)
+    except Exception as exc:  # noqa: BLE001 - JSON error for API callers, not an HTML 500
+        return jsonify({"ok": False, "error": str(exc)}), 500
     finally:
         conn.close()
-    return jsonify({"ok": True, "query": query, "hits": [_hit_to_dict(h) for h in hits]})
+    return jsonify(
+        {"ok": True, "query": query, "folder": folder, "hits": [_hit_to_dict(h) for h in hits]}
+    )
 
 
 @app.route("/image/<image_id>")

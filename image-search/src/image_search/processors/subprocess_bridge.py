@@ -71,4 +71,9 @@ class SubprocessBridgeProcessor:
         if self._proc is not None:
             self._proc.stdin.close()
             self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
             self._proc = None

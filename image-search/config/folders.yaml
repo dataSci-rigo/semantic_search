@@ -1,8 +1,10 @@
 defaults:
   text_embed: bge-small-en-v1.5
   image_embed: siglip2-base
-  face_model: buffalo_l
-  face_detect: scrfd_10g
+  # Faces (Phase 5) config keys are TBD — the loader only knows the kinds in
+  # config.PROCESSOR_KEYS, so these stay commented out until that lands:
+  # face_model: buffalo_l
+  # face_detect: scrfd_10g
 
 folders:
   # Whole photo library. Nested "Screenshots" dirs (there are several,
@@ -15,3 +17,6 @@ folders:
     overrides:
       Screenshots:
         ocr: rapidocr
+        # Overrides inherit defaults, so image_embed must be disabled
+        # explicitly to keep Screenshots OCR+text-search only.
+        image_embed: off

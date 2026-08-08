@@ -20,35 +20,48 @@ def test_content_hash_is_deterministic_and_content_addressed(tmp_path):
     assert images_store.content_hash(a) != images_store.content_hash(c)
 
 
-def test_discover_finds_images_and_reads_dims(tmp_path):
+def test_walk_images_is_stat_only_and_filters_extensions(tmp_path):
     folder = tmp_path / "shots"
     folder.mkdir()
     make_image(folder / "one.png")
     (folder / "not-an-image.txt").write_text("hi")
 
-    found = images_store.discover(folder, "shots")
-    assert len(found) == 1
-    assert found[0].width == 4 and found[0].height == 4
-    assert found[0].folder == "shots"
+    walked = images_store.walk_images(folder)
+    assert len(walked) == 1
+    path, mtime = walked[0]
+    assert path.name == "one.png"
+    assert mtime == path.stat().st_mtime
 
 
-def test_discover_missing_folder_returns_empty(tmp_path):
-    assert images_store.discover(tmp_path / "does-not-exist", "x") == []
+def test_walk_images_missing_folder_returns_empty(tmp_path):
+    assert images_store.walk_images(tmp_path / "does-not-exist") == []
 
 
-def test_dedupe_on_unchanged_mtime(tmp_path):
+def test_describe_hashes_and_reads_dims(tmp_path):
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    path = folder / "one.png"
+    make_image(path)
+    [(walked_path, mtime)] = images_store.walk_images(folder)
+
+    disc = images_store.describe(walked_path, "shots", mtime)
+    assert disc.width == 4 and disc.height == 4
+    assert disc.image_id == images_store.content_hash(path)
+    assert disc.folder == "shots"
+    assert disc.mtime == mtime
+
+
+def test_file_state_roundtrip(tmp_path):
     conn = connect(tmp_path / "test.db")
     migrate(conn)
 
-    folder = tmp_path / "shots"
-    folder.mkdir()
-    make_image(folder / "one.png")
-    [disc] = images_store.discover(folder, "shots")
+    images_store.upsert_file(conn, "/x/one.png", "shots", "id1", 100.0)
+    assert images_store.load_file_state(conn, "shots") == {"/x/one.png": ("id1", 100.0)}
+    assert images_store.load_file_state(conn, "other") == {}
 
-    assert images_store.is_unchanged(conn, disc.image_id, disc.mtime) is False
-    images_store.upsert_image(conn, disc)
-    conn.commit()
-    assert images_store.is_unchanged(conn, disc.image_id, disc.mtime) is True
+    # Upsert on the same path replaces, never duplicates.
+    images_store.upsert_file(conn, "/x/one.png", "shots", "id2", 200.0)
+    assert images_store.load_file_state(conn, "shots") == {"/x/one.png": ("id2", 200.0)}
 
 
 def test_upsert_is_idempotent_on_content_id(tmp_path):
@@ -58,7 +71,8 @@ def test_upsert_is_idempotent_on_content_id(tmp_path):
     folder = tmp_path / "shots"
     folder.mkdir()
     make_image(folder / "one.png")
-    [disc] = images_store.discover(folder, "shots")
+    [(path, mtime)] = images_store.walk_images(folder)
+    disc = images_store.describe(path, "shots", mtime)
 
     images_store.upsert_image(conn, disc)
     images_store.upsert_image(conn, disc)
@@ -66,3 +80,35 @@ def test_upsert_is_idempotent_on_content_id(tmp_path):
 
     count = conn.execute("SELECT COUNT(*) AS n FROM images").fetchone()["n"]
     assert count == 1
+    assert images_store.is_indexed(conn, disc.image_id)
+    assert not images_store.is_indexed(conn, "nope")
+
+
+def test_purge_image_removes_derived_records(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    conn.execute(
+        "INSERT INTO images (id, path, folder, content_hash) VALUES ('id1', '/x', 'f', 'id1')"
+    )
+    conn.execute("INSERT INTO ocr_text (image_id, model, text) VALUES ('id1', 'm', 't')")
+    conn.execute("INSERT INTO captions (image_id, model, text) VALUES ('id1', 'm', 't')")
+    conn.execute("INSERT INTO text_fts (image_id, text) VALUES ('id1', 't')")
+
+    images_store.purge_image(conn, "id1")
+    conn.commit()
+
+    for table in ("images", "ocr_text", "captions", "text_fts"):
+        assert conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"] == 0
+
+
+def test_duplicate_groups(tmp_path):
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    images_store.upsert_file(conn, "/x/b.png", "f", "dup-id", 1.0)
+    images_store.upsert_file(conn, "/x/a.png", "f", "dup-id", 1.0)
+    images_store.upsert_file(conn, "/x/unique.png", "f", "other-id", 1.0)
+
+    groups = images_store.duplicate_groups(conn)
+    assert groups == [("dup-id", ["/x/a.png", "/x/b.png"])]

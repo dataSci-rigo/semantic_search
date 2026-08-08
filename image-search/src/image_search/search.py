@@ -12,14 +12,18 @@ from image_search.store import vectors as vectors_store
 class SearchHit:
     image_id: str
     path: str
-    score: float  # higher is better, cross-signal normalized
+    # Higher is better within a source ("vector": -distance, "fts": -bm25);
+    # scores are NOT comparable across sources — results are concatenated,
+    # vector hits first.
+    score: float
     source: str  # "vector" | "fts"
 
 
 def _fts_match_expr(query: str) -> str:
     # Quote each token so punctuation in the raw query can't break FTS5's
-    # MATCH grammar (e.g. "unemployment: graphs?" would otherwise error).
-    tokens = query.split()
+    # MATCH grammar (e.g. "unemployment: graphs?" would otherwise error);
+    # embedded double quotes are escaped by doubling, per FTS5 string syntax.
+    tokens = [tok.replace('"', '""') for tok in query.split()]
     return " ".join(f'"{tok}"' for tok in tokens) if tokens else '""'
 
 
@@ -64,7 +68,11 @@ def search_text(
     def rows_for(hits: list[tuple[str, float]], source: str) -> list[SearchHit]:
         out = []
         for image_id, score in hits:
-            row = conn.execute("SELECT path FROM images WHERE id = ?", (image_id,)).fetchone()
+            # Post-filter to the requested folder: the FTS/vector queries scan
+            # every folder's rows, so fewer than k hits may survive.
+            row = conn.execute(
+                "SELECT path FROM images WHERE id = ? AND folder = ?", (image_id, folder_key)
+            ).fetchone()
             if row is None:
                 continue
             out.append(SearchHit(image_id=image_id, path=row["path"], score=score, source=source))
@@ -102,7 +110,10 @@ def search_similar_images(
     for iid, dist in raw:
         if iid == image_id:
             continue
-        row = conn.execute("SELECT path FROM images WHERE id = ?", (iid,)).fetchone()
+        # Same folder post-filter as search_text's rows_for.
+        row = conn.execute(
+            "SELECT path FROM images WHERE id = ? AND folder = ?", (iid, folder_key)
+        ).fetchone()
         if row is None:
             continue
         out.append(SearchHit(image_id=iid, path=row["path"], score=-dist, source="vector"))

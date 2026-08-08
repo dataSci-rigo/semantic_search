@@ -12,6 +12,8 @@
   form { display: flex; gap: .5rem; margin-bottom: 1rem; }
   input[type=text] { flex: 1; background: #1e293b; border: 1px solid #334155;
          border-radius: 8px; padding: .7rem .9rem; color: #e2e8f0; font-size: 1rem; }
+  select { background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+         padding: .7rem .6rem; color: #e2e8f0; font-size: .9rem; max-width: 12rem; }
   button { border: none; border-radius: 8px; padding: .7rem 1.1rem; font-size: .9rem;
            font-weight: 600; cursor: pointer; background: #1e3a5f; color: #7dd3fc; }
   .error { background: #7f1d1d; color: #f87171; border-radius: 8px; padding: .75rem;
@@ -34,6 +36,13 @@
 
 <form method="get" action="/">
   <input type="text" name="q" value="{{ query }}" placeholder="search your photos…" autofocus>
+  {% if folders|length > 1 %}
+  <select name="folder">
+    {% for f in folders %}
+    <option value="{{ f }}" {% if f == folder %}selected{% endif %}>{{ f.rsplit('/', 1)[-1] or f }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
   <button type="submit">Search</button>
 </form>
 
@@ -53,7 +62,7 @@
       <span class="score">{{ "%.3f"|format(hit.score) }}</span> · {{ hit.source }}
     </div>
     <div class="card-links">
-      <a href="/similar/{{ hit.image_id }}">similar</a>
+      <a href="/similar/{{ hit.image_id }}?folder={{ folder|urlencode }}">similar</a>
       <a href="/full/{{ hit.image_id }}">full size</a>
     </div>
   </div>

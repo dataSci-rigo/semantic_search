@@ -34,7 +34,7 @@ def test_off_excludes_processor(tmp_path):
         tmp_path,
         """
         defaults:
-          face_model: buffalo_l
+          faces: buffalo_l
         folders:
           "~/Photos":
             faces: off
@@ -42,6 +42,40 @@ def test_off_excludes_processor(tmp_path):
     )
     config = load_config(path)
     assert "faces" not in config.folders["~/Photos"].processors
+
+
+def test_unknown_keys_warn(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        defaults:
+          face_model: buffalo_l
+        folders:
+          "~/Photos":
+            ocr: rapidocr
+            face_detect: scrfd_10g
+        """,
+    )
+    with pytest.warns(UserWarning, match="face_model"):
+        with pytest.warns(UserWarning, match="face_detect"):
+            config = load_config(path)
+    # Unknown keys are dropped, known ones survive.
+    assert config.folders["~/Photos"].processors == {"ocr": "rapidocr"}
+
+
+def test_bool_model_value_raises(tmp_path):
+    # YAML parses bare `on` as boolean True — reject loudly instead of
+    # passing True downstream as a model id.
+    path = write_config(
+        tmp_path,
+        """
+        folders:
+          "~/Photos":
+            ocr: on
+        """,
+    )
+    with pytest.raises(ValueError, match="ocr"):
+        load_config(path)
 
 
 def test_explicit_override_beats_default(tmp_path):

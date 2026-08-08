@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from image_search.processors.base import ImageEmbedRecord, LoadedImage, Record
 
 # HuggingFace repo ids, keyed by the short names used in config.
@@ -33,8 +35,13 @@ class SiglipImageEmbedProcessor:
 
         repo = MODEL_REPOS.get(self.model_id, self.model_id)
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Reduced-precision weights for RAM-constrained machines (e.g.
+        # "bfloat16" halves the fp32 footprint; needed on <4GB WSL hosts).
+        dtype_name = os.environ.get("IMAGE_SEARCH_TORCH_DTYPE")
+        self._dtype = getattr(torch, dtype_name) if dtype_name else None
+        kwargs = {"dtype": self._dtype} if self._dtype else {}
         self._processor = AutoProcessor.from_pretrained(repo)
-        self._model = AutoModel.from_pretrained(repo).to(self._device).eval()
+        self._model = AutoModel.from_pretrained(repo, **kwargs).to(self._device).eval()
 
     def embed(self, path) -> list[float]:
         """Embed an image file (used for both indexing and query-by-image)."""
@@ -44,11 +51,15 @@ class SiglipImageEmbedProcessor:
 
         img = Image.open(path).convert("RGB")
         inputs = self._processor(images=img, return_tensors="pt").to(self._device)
+        if self._dtype is not None:
+            inputs = inputs.to(self._dtype)  # casts floating tensors only
         with torch.no_grad():
             out = self._model.get_image_features(**inputs)
-        feats = out.pooler_output
+        # transformers <5 returns an output object with pooler_output; 5.x
+        # returns the pooled tensor directly.
+        feats = out if isinstance(out, torch.Tensor) else out.pooler_output
         feats = feats / feats.norm(dim=-1, keepdim=True)
-        return feats[0].cpu().tolist()
+        return feats[0].float().cpu().tolist()
 
     def process(self, img: LoadedImage) -> list[Record]:
         return [ImageEmbedRecord(model=self.model_id, vector=self.embed(img.path))]
