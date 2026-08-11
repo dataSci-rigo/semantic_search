@@ -11,12 +11,16 @@ from image_search.store import vectors as vectors_store
 @dataclass(frozen=True)
 class SearchHit:
     image_id: str
-    path: str
+    path: str  # image path, or the note/.links file the item came from
     # Higher is better within a source ("vector": -distance, "fts": -bm25);
     # scores are NOT comparable across sources — results are concatenated,
     # vector hits first.
     score: float
     source: str  # "vector" | "fts"
+    kind: str = "image"  # "image" | "note" | "link"
+    title: str | None = None
+    url: str | None = None
+    snippet: str | None = None
 
 
 def _fts_match_expr(query: str) -> str:
@@ -69,13 +73,34 @@ def search_text(
         out = []
         for image_id, score in hits:
             # Post-filter to the requested folder: the FTS/vector queries scan
-            # every folder's rows, so fewer than k hits may survive.
+            # every folder's rows, so fewer than k hits may survive. An id
+            # resolves either to an image or to a note/link item.
             row = conn.execute(
                 "SELECT path FROM images WHERE id = ? AND folder = ?", (image_id, folder_key)
             ).fetchone()
-            if row is None:
+            if row is not None:
+                out.append(
+                    SearchHit(image_id=image_id, path=row["path"], score=score, source=source)
+                )
                 continue
-            out.append(SearchHit(image_id=image_id, path=row["path"], score=score, source=source))
+            item = conn.execute(
+                "SELECT kind, src_path, title, url, substr(body, 1, 300) AS snippet "
+                "FROM items WHERE id = ? AND folder = ?",
+                (image_id, folder_key),
+            ).fetchone()
+            if item is not None:
+                out.append(
+                    SearchHit(
+                        image_id=image_id,
+                        path=item["src_path"],
+                        score=score,
+                        source=source,
+                        kind=item["kind"],
+                        title=item["title"],
+                        url=item["url"],
+                        snippet=item["snippet"],
+                    )
+                )
         return out
 
     return rows_for(vector_hits, "vector") + rows_for(fts_hits, "fts")

@@ -28,6 +28,22 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS idx_files_image_id ON files(image_id);
 CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder);
 
+-- Non-image "interesting stuff": notes (.md/.txt files) and links (from
+-- .links files or /api/save). Shares text_fts and the text vector tables
+-- with images — the id columns there hold item ids just as well.
+CREATE TABLE IF NOT EXISTS items (
+  id         TEXT PRIMARY KEY,   -- note: sha256 of file bytes; link: sha256("link:"+url)
+  kind       TEXT NOT NULL,      -- "note" | "link"
+  folder     TEXT NOT NULL,      -- config key this item belongs to
+  src_path   TEXT NOT NULL,      -- the file it came from
+  title      TEXT,
+  url        TEXT,
+  body       TEXT,
+  created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_items_folder ON items(folder);
+CREATE INDEX IF NOT EXISTS idx_items_src_path ON items(src_path);
+
 -- FREE outputs: text. Multiple models may coexist (model column).
 CREATE TABLE IF NOT EXISTS ocr_text (image_id TEXT, model TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS captions (image_id TEXT, model TEXT, text TEXT);

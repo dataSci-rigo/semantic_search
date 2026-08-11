@@ -32,14 +32,18 @@ class DiscoveredImage:
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"}
 
 
-def walk_images(folder_path: Path) -> list[tuple[Path, float]]:
-    """Stat-only walk: (path, mtime) for every image file, sorted by path.
-    No hashing here — ingest hashes only paths whose mtime changed."""
+def walk_candidates(folder_path: Path) -> list[tuple[Path, float]]:
+    """Stat-only walk: (path, mtime) for every ingestible file (images plus
+    note/.links text files), sorted by path. No hashing here — ingest hashes
+    only paths whose mtime changed."""
+    from image_search.textitems import LINKS_EXTENSION, NOTE_EXTENSIONS
+
+    extensions = IMAGE_EXTENSIONS | NOTE_EXTENSIONS | {LINKS_EXTENSION}
     out: list[tuple[Path, float]] = []
     if not folder_path.exists():
         return out
     for path in sorted(folder_path.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+        if not path.is_file() or path.suffix.lower() not in extensions:
             continue
         out.append((path, path.stat().st_mtime))
     return out
@@ -125,11 +129,18 @@ def purge_image(conn: sqlite3.Connection, image_id: str) -> None:
     conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
 
 
+def purge_item(conn: sqlite3.Connection, item_id: str) -> None:
+    """Delete a note/link item and its derived records (FTS, vectors)."""
+    conn.execute("DELETE FROM text_fts WHERE image_id = ?", (item_id,))
+    vectors_store.delete_vectors(conn, item_id)
+    conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+
+
 def prune_missing(conn: sqlite3.Connection, folder_key: str, seen_paths: set[str]) -> int:
     """Drop files rows for paths that vanished from this folder, then purge
-    every image of this folder whose content no path references anymore —
-    whether the path was deleted or edited in place (re-pointed to a new
-    content id). Returns the number of images purged."""
+    every image or item of this folder whose content no path references
+    anymore — whether the path was deleted or edited in place (re-pointed to
+    a new content id). Returns the number of images+items purged."""
     for row in conn.execute(
         "SELECT path FROM files WHERE folder = ?", (folder_key,)
     ).fetchall():
@@ -143,7 +154,23 @@ def prune_missing(conn: sqlite3.Connection, folder_key: str, seen_paths: set[str
     ).fetchall()
     for row in orphans:
         purge_image(conn, row["id"])
-    return len(orphans)
+
+    # Notes are content-addressed like images (files.image_id holds the note
+    # id); links are keyed to their source .links file instead, since one
+    # file yields many items.
+    orphan_items = conn.execute(
+        """
+        SELECT id FROM items WHERE folder = ? AND (
+          (kind = 'note' AND id NOT IN (SELECT image_id FROM files))
+          OR (kind = 'link' AND src_path NOT IN (SELECT path FROM files))
+        )
+        """,
+        (folder_key,),
+    ).fetchall()
+    for row in orphan_items:
+        purge_item(conn, row["id"])
+
+    return len(orphans) + len(orphan_items)
 
 
 def duplicate_groups(conn: sqlite3.Connection) -> list[tuple[str, list[str]]]:
