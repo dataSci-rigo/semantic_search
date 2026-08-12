@@ -403,3 +403,146 @@ def test_deleted_file_prunes_vectors(tmp_path):
     (folder / "gone.png").unlink()
     ingest_folder(conn, config, registry, str(folder))
     assert _counts(conn, "vec_map")["vec_map"] == 1
+
+
+# ---- notes & links ----------------------------------------------------------
+
+def _fake_fetch(url):
+    return "Example Domain", f"page text for {url}"
+
+
+def test_ingest_note_and_links_alongside_images(tmp_path, monkeypatch):
+    from image_search import textitems
+
+    monkeypatch.setattr(textitems, "fetch_page", _fake_fetch)
+
+    folder = tmp_path / "saved"
+    folder.mkdir()
+    Image.new("RGB", (4, 4)).save(folder / "meme.png")
+    (folder / "idea.md").write_text("# Big Idea\n\nwrite a meme search engine\n")
+    (folder / "saved.links").write_text(
+        "https://example.com/a  why it matters\nhttps://example.com/b\n"
+    )
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    stats = ingest_folder(conn, config, registry, str(folder))
+    assert stats == {"seen": 3, "skipped": 0, "indexed": 3, "pruned": 0}
+
+    items = conn.execute("SELECT kind, title, url FROM items ORDER BY kind, url").fetchall()
+    assert [(r["kind"], r["title"]) for r in items] == [
+        ("link", "Example Domain"),
+        ("link", "Example Domain"),
+        ("note", "Big Idea"),
+    ]
+    assert items[0]["url"] == "https://example.com/a"
+    # 1 OCR row + 1 note + 2 links in FTS
+    assert _counts(conn, "text_fts")["text_fts"] == 4
+
+    # Idempotent rerun: nothing reprocessed.
+    second = ingest_folder(conn, config, registry, str(folder))
+    assert second == {"seen": 3, "skipped": 3, "indexed": 0, "pruned": 0}
+    assert _counts(conn, "text_fts")["text_fts"] == 4
+
+
+def test_links_file_diff_adds_and_removes(tmp_path, monkeypatch):
+    import os
+
+    from image_search import textitems
+
+    monkeypatch.setattr(textitems, "fetch_page", _fake_fetch)
+
+    folder = tmp_path / "saved"
+    folder.mkdir()
+    links = folder / "saved.links"
+    links.write_text("https://example.com/a\nhttps://example.com/b\n")
+
+    config = make_config(tmp_path, str(folder), with_ocr=False, with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    assert _counts(conn, "items")["items"] == 2
+
+    links.write_text("https://example.com/b\nhttps://example.com/c\n")
+    os.utime(links, (links.stat().st_atime, links.stat().st_mtime + 5))
+    ingest_folder(conn, config, registry, str(folder))
+
+    urls = [r["url"] for r in conn.execute("SELECT url FROM items ORDER BY url")]
+    assert urls == ["https://example.com/b", "https://example.com/c"]
+    assert _counts(conn, "text_fts")["text_fts"] == 2
+
+
+def test_edited_note_reindexes_and_prunes_old(tmp_path):
+    import os
+
+    folder = tmp_path / "saved"
+    folder.mkdir()
+    note = folder / "idea.md"
+    note.write_text("# Old Title\n\nold body\n")
+
+    config = make_config(tmp_path, str(folder), with_ocr=False, with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    note.write_text("# New Title\n\nnew body\n")
+    os.utime(note, (note.stat().st_atime, note.stat().st_mtime + 5))
+    second = ingest_folder(conn, config, registry, str(folder))
+
+    assert second == {"seen": 1, "skipped": 0, "indexed": 1, "pruned": 1}
+    rows = conn.execute("SELECT title FROM items").fetchall()
+    assert [r["title"] for r in rows] == ["New Title"]
+    assert _counts(conn, "text_fts")["text_fts"] == 1
+
+
+def test_deleted_links_file_prunes_its_items(tmp_path, monkeypatch):
+    from image_search import textitems
+
+    monkeypatch.setattr(textitems, "fetch_page", _fake_fetch)
+
+    folder = tmp_path / "saved"
+    folder.mkdir()
+    links = folder / "saved.links"
+    links.write_text("https://example.com/a\n")
+
+    config = make_config(tmp_path, str(folder), with_ocr=False, with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    assert _counts(conn, "items")["items"] == 1
+
+    links.unlink()
+    second = ingest_folder(conn, config, registry, str(folder))
+    assert second["pruned"] == 1
+    assert _counts(conn, "items", "text_fts") == {"items": 0, "text_fts": 0}
+
+
+def test_note_and_link_text_vectors(tmp_path, monkeypatch):
+    pytest.importorskip("sqlite_vec", reason="requires sqlite-vec (Phase 1 dependency)")
+    from image_search import textitems
+
+    monkeypatch.setattr(textitems, "fetch_page", _fake_fetch)
+
+    folder = tmp_path / "saved"
+    folder.mkdir()
+    (folder / "idea.md").write_text("# Idea\n\nbody\n")
+    (folder / "saved.links").write_text("https://example.com/a\n")
+
+    config = make_config(tmp_path, str(folder), with_ocr=False, with_text_embed=True)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    rows = conn.execute(
+        "SELECT vec_table, COUNT(*) AS n FROM vec_map GROUP BY vec_table"
+    ).fetchall()
+    assert {r["vec_table"]: r["n"] for r in rows} == {"vec_text__fake_embed": 2}

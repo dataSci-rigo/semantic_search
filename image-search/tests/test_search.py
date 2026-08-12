@@ -119,3 +119,33 @@ def test_query_with_embedded_quotes_does_not_error(tmp_path):
 
     # Previously raised sqlite3.OperationalError from malformed FTS5 syntax.
     assert search_text(conn, config, registry, folder, 'say "hi" now') == []
+
+
+def test_search_returns_note_and_link_hits(tmp_path):
+    folder = str(tmp_path / "saved")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO items (id, kind, folder, src_path, title, url, body) "
+        "VALUES ('note1', 'note', ?, '/x/idea.md', 'Big Idea', NULL, 'meme search engine')",
+        (folder,),
+    )
+    conn.execute(
+        "INSERT INTO items (id, kind, folder, src_path, title, url, body) "
+        "VALUES ('link1', 'link', ?, '/x/saved.links', 'Example', "
+        "'https://example.com', 'meme reference page')",
+        (folder,),
+    )
+    conn.execute("INSERT INTO text_fts (image_id, text) VALUES ('note1', 'meme search engine')")
+    conn.execute("INSERT INTO text_fts (image_id, text) VALUES ('link1', 'meme reference page')")
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "meme")
+    by_kind = {h.kind: h for h in hits}
+    assert set(by_kind) == {"note", "link"}
+    assert by_kind["note"].title == "Big Idea"
+    assert by_kind["note"].snippet == "meme search engine"
+    assert by_kind["link"].url == "https://example.com"

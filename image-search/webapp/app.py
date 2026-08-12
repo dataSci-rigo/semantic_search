@@ -12,9 +12,11 @@ this code directly.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import sys
+import time
 from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, render_template, request
@@ -67,6 +69,10 @@ def _hit_to_dict(hit: SearchHit) -> dict:
         "path": hit.path,
         "score": hit.score,
         "source": hit.source,
+        "kind": hit.kind,
+        "title": hit.title,
+        "url": hit.url,
+        "snippet": hit.snippet,
     }
 
 
@@ -129,6 +135,50 @@ def api_search():
     return jsonify(
         {"ok": True, "query": query, "folder": folder, "hits": [_hit_to_dict(h) for h in hits]}
     )
+
+
+@app.route("/api/save", methods=["POST"])
+def api_save():
+    """Capture endpoint for external savers (e.g. the Discord bot): drop an
+    image upload, a URL, or a text note into IMAGE_SEARCH_SAVE_DIR, where the
+    next `image-search index` run picks it up. Tailscale-only trust, like
+    every other route here."""
+    save_dir_env = os.environ.get("IMAGE_SEARCH_SAVE_DIR")
+    if not save_dir_env:
+        return jsonify(
+            {"ok": False, "error": "IMAGE_SEARCH_SAVE_DIR is not configured on the server"}
+        ), 400
+    save_dir = Path(save_dir_env)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    if "file" in request.files:
+        from werkzeug.utils import secure_filename
+
+        upload = request.files["file"]
+        name = secure_filename(upload.filename or "") or "upload.png"
+        target = save_dir / f"{int(time.time())}-{name}"
+        upload.save(target)
+        return jsonify({"ok": True, "kind": "image", "saved": str(target)})
+
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    text = (data.get("text") or "").strip()
+    if url:
+        comment = " ".join((data.get("comment") or "").split())
+        links_file = save_dir / "saved.links"
+        with links_file.open("a", encoding="utf-8") as fh:
+            fh.write(f"{url} {comment}".strip() + "\n")
+        return jsonify({"ok": True, "kind": "link", "saved": str(links_file)})
+    if text:
+        title = (data.get("title") or "").strip()
+        content = (f"# {title}\n\n{text}" if title else text) + "\n"
+        digest = hashlib.sha256(content.encode()).hexdigest()[:8]
+        note_file = save_dir / f"note-{digest}.md"
+        note_file.write_text(content, encoding="utf-8")
+        return jsonify({"ok": True, "kind": "note", "saved": str(note_file)})
+    return jsonify(
+        {"ok": False, "error": "provide multipart 'file', or JSON with 'url' or 'text'"}
+    ), 400
 
 
 @app.route("/image/<image_id>")

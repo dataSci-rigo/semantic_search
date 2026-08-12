@@ -20,21 +20,21 @@ def test_content_hash_is_deterministic_and_content_addressed(tmp_path):
     assert images_store.content_hash(a) != images_store.content_hash(c)
 
 
-def test_walk_images_is_stat_only_and_filters_extensions(tmp_path):
+def test_walk_candidates_is_stat_only_and_filters_extensions(tmp_path):
     folder = tmp_path / "shots"
     folder.mkdir()
     make_image(folder / "one.png")
-    (folder / "not-an-image.txt").write_text("hi")
+    (folder / "note.txt").write_text("a note — ingestible")
+    (folder / "junk.log").write_text("not ingestible")
 
-    walked = images_store.walk_images(folder)
-    assert len(walked) == 1
-    path, mtime = walked[0]
-    assert path.name == "one.png"
-    assert mtime == path.stat().st_mtime
+    walked = images_store.walk_candidates(folder)
+    assert [p.name for p, _ in walked] == ["note.txt", "one.png"]
+    for path, mtime in walked:
+        assert mtime == path.stat().st_mtime
 
 
-def test_walk_images_missing_folder_returns_empty(tmp_path):
-    assert images_store.walk_images(tmp_path / "does-not-exist") == []
+def test_walk_candidates_missing_folder_returns_empty(tmp_path):
+    assert images_store.walk_candidates(tmp_path / "does-not-exist") == []
 
 
 def test_describe_hashes_and_reads_dims(tmp_path):
@@ -42,7 +42,7 @@ def test_describe_hashes_and_reads_dims(tmp_path):
     folder.mkdir()
     path = folder / "one.png"
     make_image(path)
-    [(walked_path, mtime)] = images_store.walk_images(folder)
+    [(walked_path, mtime)] = images_store.walk_candidates(folder)
 
     disc = images_store.describe(walked_path, "shots", mtime)
     assert disc.width == 4 and disc.height == 4
@@ -71,7 +71,7 @@ def test_upsert_is_idempotent_on_content_id(tmp_path):
     folder = tmp_path / "shots"
     folder.mkdir()
     make_image(folder / "one.png")
-    [(path, mtime)] = images_store.walk_images(folder)
+    [(path, mtime)] = images_store.walk_candidates(folder)
     disc = images_store.describe(path, "shots", mtime)
 
     images_store.upsert_image(conn, disc)

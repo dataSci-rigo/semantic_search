@@ -28,6 +28,15 @@
   .card-info .score { color: #7dd3fc; font-weight: 600; }
   .card-links { display: flex; gap: .5rem; padding: 0 .6rem .5rem; }
   .card-links a { font-size: .7rem; color: #a78bfa; text-decoration: none; }
+  .text-card { padding: .6rem; display: flex; flex-direction: column; gap: .35rem; }
+  .text-card .card-info { padding: 0; }
+  .text-card .kind { color: #fbbf24; font-weight: 600; text-transform: uppercase;
+                     font-size: .65rem; letter-spacing: .06em; }
+  .card-title { font-size: .85rem; color: #e2e8f0; font-weight: 600;
+                overflow-wrap: anywhere; }
+  .card-title a { color: #7dd3fc; text-decoration: none; }
+  .card-snippet { font-size: .72rem; color: #94a3b8; overflow: hidden;
+                  display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; }
 </style>
 </head>
 <body>
@@ -56,6 +65,7 @@
 
 <div class="grid">
   {% for hit in hits %}
+  {% if hit.kind == "image" %}
   <div class="card">
     <a href="/full/{{ hit.image_id }}"><img src="/image/{{ hit.image_id }}" loading="lazy"></a>
     <div class="card-info">
@@ -66,6 +76,19 @@
       <a href="/full/{{ hit.image_id }}">full size</a>
     </div>
   </div>
+  {% else %}
+  <div class="card text-card">
+    <div class="card-info">
+      <span class="kind">{{ hit.kind }}</span> ·
+      <span class="score">{{ "%.3f"|format(hit.score) }}</span> · {{ hit.source }}
+    </div>
+    <div class="card-title">
+      {% if hit.url %}<a href="{{ hit.url }}" rel="noopener">{{ hit.title or hit.url }}</a>
+      {% else %}{{ hit.title }}{% endif %}
+    </div>
+    {% if hit.snippet %}<div class="card-snippet">{{ hit.snippet }}</div>{% endif %}
+  </div>
+  {% endif %}
   {% endfor %}
 </div>
 
