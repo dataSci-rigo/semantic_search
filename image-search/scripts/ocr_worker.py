@@ -17,13 +17,18 @@ parent knows when it's safe to start sending paths.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 
 def main() -> None:
     from rapidocr import RapidOCR
 
-    engine = RapidOCR(params={"EngineConfig.onnxruntime.use_cuda": True})
+    # GPU by default (the laptop's whole reason for a separate cuDNN 8 env);
+    # set IMAGE_SEARCH_OCR_USE_CUDA=0 on CPU-only machines, where onnxruntime
+    # would otherwise fail to find a CUDA provider.
+    use_cuda = os.environ.get("IMAGE_SEARCH_OCR_USE_CUDA", "1") not in ("0", "false", "")
+    engine = RapidOCR(params={"EngineConfig.onnxruntime.use_cuda": use_cuda})
     print("READY", flush=True)
 
     for line in sys.stdin:

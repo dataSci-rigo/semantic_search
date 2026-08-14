@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,13 @@ class SubprocessBridgeProcessor:
         self.model_id = model_id
         self._proc: subprocess.Popen | None = None
 
+    def env_name(self) -> str:
+        """Conda env to run the worker in. `IMAGE_SEARCH_<KIND>_ENV` overrides
+        the class default, so a machine that keeps the deps somewhere else
+        (e.g. a CPU-only box with no cuDNN conflict to work around) can point
+        at its own env without editing code."""
+        return os.environ.get(f"IMAGE_SEARCH_{self.kind.upper()}_ENV", self.conda_env)
+
     def load(self) -> None:
         if self._proc is not None:
             return
@@ -32,7 +40,7 @@ class SubprocessBridgeProcessor:
             raise RuntimeError(f"Worker script not found at {self.worker_script}")
 
         self._proc = subprocess.Popen(
-            ["conda", "run", "-n", self.conda_env, "--no-capture-output",
+            ["conda", "run", "-n", self.env_name(), "--no-capture-output",
              "python", str(self.worker_script)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -44,7 +52,7 @@ class SubprocessBridgeProcessor:
         if ready_line.strip() != "READY":
             self._proc.kill()
             raise RuntimeError(
-                f"Worker failed to start (env={self.conda_env!r}): "
+                f"Worker failed to start (env={self.env_name()!r}): "
                 f"expected READY, got {ready_line!r}"
             )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import warnings
 from pathlib import Path
@@ -17,6 +18,14 @@ DEFAULT_DB = Path(__file__).resolve().parents[2] / "index.db"
 
 
 def cmd_index(args: argparse.Namespace) -> None:
+    # Stream per-file failures to stderr as they happen: a full-library index
+    # runs for days, so deferring them to the end (as the warning capture
+    # below does) would hide them for the whole run.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     config = load_config(args.config)
     conn = connect(args.db)
     migrate(conn)
@@ -28,6 +37,17 @@ def cmd_index(args: argparse.Namespace) -> None:
             print(f"warning: {w.message}", file=sys.stderr)
     for folder_key, folder_stats in stats.items():
         print(f"{folder_key}: {folder_stats}")
+
+    # Exit 0 even when individual files failed: a non-zero exit would trip
+    # systemd's Restart=on-failure and recreate the restart loop that per-file
+    # isolation exists to prevent. Failures are surfaced in the log + summary.
+    total_failed = sum(s.get("failed", 0) for s in stats.values())
+    if total_failed:
+        print(
+            f"{total_failed} file(s) failed and were skipped; they will be retried "
+            "on the next run (see the log above for paths).",
+            file=sys.stderr,
+        )
 
 
 def cmd_search(args: argparse.Namespace) -> None:

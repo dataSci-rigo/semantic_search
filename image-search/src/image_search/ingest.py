@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from image_search.registry import Registry
 from image_search.store import images as images_store
 from image_search.store import vectors as vectors_store
 
+logger = logging.getLogger(__name__)
+
 
 def ingest_folder(
     conn: sqlite3.Connection, config: SearchConfig, registry: Registry, folder_key: str
@@ -28,33 +31,60 @@ def ingest_folder(
     mtimes, no re-hashing), while processing happens once per *content id* —
     renames, metadata-only touches, and byte-identical duplicate copies never
     reprocess or duplicate derived records. Content no path references anymore
-    is purged at the end. Returns counts."""
+    is purged at the end.
+
+    One bad file costs one file: a failing processor (corrupt image, transient
+    OCR/caption worker hiccup) is logged and counted, and the walk continues.
+    Nothing was committed for that file, so the next full run retries it —
+    which is the whole point, since a multi-day index under systemd
+    Restart=on-failure would otherwise restart-loop on it forever.
+
+    Returns counts, including "failed"."""
     folder = config.folders[folder_key]
     walked = images_store.walk_candidates(folder.path)
     known = images_store.load_file_state(conn, folder_key)
 
-    stats = {"seen": len(walked), "skipped": 0, "indexed": 0, "pruned": 0}
+    stats = {"seen": len(walked), "skipped": 0, "indexed": 0, "pruned": 0, "failed": 0}
     seen_paths: set[str] = set()
+    failed_paths: list[str] = []
 
     for path, mtime in walked:
         path_str = str(path)
+        # Added before dispatch so a file that fails is never mistaken for a
+        # deleted one and purged by prune_missing below.
         seen_paths.add(path_str)
         prior = known.get(path_str)
         if prior is not None and prior[1] == mtime:
             stats["skipped"] += 1
             continue
 
-        suffix = path.suffix.lower()
-        if suffix in textitems.NOTE_EXTENSIONS:
-            indexed = _ingest_note(conn, registry, folder, folder_key, path, mtime)
-        elif suffix == textitems.LINKS_EXTENSION:
-            indexed = _ingest_links(conn, registry, folder, folder_key, path, mtime)
-        else:
-            indexed = _ingest_image(conn, registry, folder, folder_key, path, mtime)
-        stats["indexed" if indexed else "skipped"] += 1
+        try:
+            suffix = path.suffix.lower()
+            if suffix in textitems.NOTE_EXTENSIONS:
+                indexed = _ingest_note(conn, registry, folder, folder_key, path, mtime)
+            elif suffix == textitems.LINKS_EXTENSION:
+                indexed = _ingest_links(conn, registry, folder, folder_key, path, mtime)
+            else:
+                indexed = _ingest_image(conn, registry, folder, folder_key, path, mtime)
+            stats["indexed" if indexed else "skipped"] += 1
+        except Exception:  # noqa: BLE001 - one bad file must not end the run
+            # Discard this file's partial writes: the _ingest_* helpers commit
+            # only on success, so without this rollback its half-written rows
+            # would ride along on the next file's commit.
+            conn.rollback()
+            logger.exception("ingest failed for %s (skipped; retried next run)", path_str)
+            stats["failed"] += 1
+            failed_paths.append(path_str)
 
     stats["pruned"] = images_store.prune_missing(conn, folder_key, seen_paths)
     conn.commit()
+    if failed_paths:
+        logger.warning(
+            "%s: %d file(s) failed and were skipped, e.g. %s",
+            folder_key,
+            len(failed_paths),
+            ", ".join(failed_paths[:3]),
+        )
     return stats
 
 
@@ -223,7 +253,18 @@ def _ingest_image(
 
 
 def ingest_all(conn: sqlite3.Connection, config: SearchConfig, registry: Registry) -> dict:
-    return {
-        folder_key: ingest_folder(conn, config, registry, folder_key)
-        for folder_key in config.folders
-    }
+    """Index every configured folder. A folder that fails outright (unreadable
+    path, unmounted drive — walk_candidates throws before per-file handling
+    can help) is reported and skipped so the remaining folders still index."""
+    out: dict[str, dict] = {}
+    for folder_key in config.folders:
+        try:
+            out[folder_key] = ingest_folder(conn, config, registry, folder_key)
+        except Exception as exc:  # noqa: BLE001 - one bad folder must not end the run
+            conn.rollback()
+            logger.exception("ingest failed for folder %s (skipped)", folder_key)
+            out[folder_key] = {
+                "seen": 0, "skipped": 0, "indexed": 0, "pruned": 0, "failed": 0,
+                "error": str(exc),
+            }
+    return out
