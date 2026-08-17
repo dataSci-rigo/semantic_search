@@ -41,7 +41,7 @@ def main() -> None:
             continue
         try:
             img = Image.open(path).convert("RGB")
-            result = model.caption(img, length="short")
+            result = model.caption(img, length="normal")
             print(json.dumps({"text": result["caption"]}), flush=True)
         except Exception as exc:  # noqa: BLE001 - report to parent, keep serving
             print(json.dumps({"error": str(exc)}), flush=True)

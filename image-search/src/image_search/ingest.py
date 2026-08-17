@@ -11,6 +11,7 @@ from image_search.processors.base import (
     ImageEmbedRecord,
     LoadedImage,
     OcrRecord,
+    TagRecord,
     TextEmbedRecord,
 )
 from image_search.registry import Registry
@@ -201,13 +202,24 @@ def _ingest_image(
     processors = registry.for_processors(folder.processors_for_path(disc.path))
 
     accumulated_text = ""
+    image_vector: list[float] | None = None
+    ranked_tags: list[tuple[str, float, int]] = []
+    tag_records: list[TagRecord] = []
     for kind, processor in processors:
+        # Content-based routing (route: auto): the tagger ran earlier in this
+        # same pass — dispatch order puts image_embed and tagger first — so
+        # its labels decide whether the costly text/caption steps apply to
+        # this particular image rather than to its whole folder.
+        if not folder.routing.wants(kind, ranked_tags):
+            continue
+
         img = LoadedImage(
             image_id=disc.image_id,
             path=disc.path,
             width=disc.width,
             height=disc.height,
             text=accumulated_text,
+            image_vector=image_vector,
         )
         for record in processor.process(img):
             if isinstance(record, OcrRecord):
@@ -238,10 +250,30 @@ def _ingest_image(
                 vectors_store.insert_vector(
                     conn, "image", record.model, disc.image_id, record.vector
                 )
+                # Handed to the tagger below so it classifies without a
+                # second vision forward pass.
+                image_vector = record.vector
+            elif isinstance(record, TagRecord):
+                tag_records.append(record)
             else:
                 raise NotImplementedError(
                     f"ingest does not yet handle record type {type(record).__name__}"
                 )
+
+        if kind == "tagger" and tag_records:
+            # Rank now (1 = best match for this image): raw cosines are not
+            # comparable across images, so rank is what routing below and
+            # facet search filter on.
+            ordered = sorted(tag_records, key=lambda r: r.score, reverse=True)
+            ranked_tags = [(r.tag, r.score, i + 1) for i, r in enumerate(ordered)]
+            conn.executemany(
+                "INSERT INTO tags (image_id, tag, source, score, rank) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (disc.image_id, r.tag, r.source, r.score, i + 1)
+                    for i, r in enumerate(ordered)
+                ],
+            )
+            tag_records = []
 
     # Written only after every processor succeeded: the images row is the
     # done-marker is_indexed checks, and the per-image commit below makes

@@ -149,3 +149,76 @@ def test_search_returns_note_and_link_hits(tmp_path):
     assert by_kind["note"].title == "Big Idea"
     assert by_kind["note"].snippet == "meme search engine"
     assert by_kind["link"].url == "https://example.com"
+
+
+def _tag(conn, image_id, tag, rank):
+    conn.execute(
+        "INSERT INTO tags (image_id, tag, source, score, rank) VALUES (?, ?, 'clip-zs', 0.4, ?)",
+        (image_id, tag, rank),
+    )
+
+
+def test_query_facet_filters_by_image_type(tmp_path):
+    """Spec 7.3 worked example: 'population graphs' filters to charts and
+    ranks on 'population'."""
+    from image_search.search import parse_facets
+
+    folder = str(tmp_path / "mixed")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    _insert_image(conn, "chart1", folder, "world population growth by year")
+    _insert_image(conn, "photo1", folder, "population of the island beach resort")
+    _tag(conn, "chart1", "chart", 1)
+    _tag(conn, "photo1", "photo", 1)
+    conn.commit()
+
+    # The facet word is consumed as a filter, not searched for.
+    assert parse_facets("population graphs") == ("population", {"chart"})
+
+    hits = search_text(conn, config, registry, folder, "population graphs")
+    assert [h.image_id for h in hits] == ["chart1"]
+
+    # Without the facet word, both match.
+    hits = search_text(conn, config, registry, folder, "population")
+    assert {h.image_id for h in hits} == {"chart1", "photo1"}
+
+
+def test_explicit_tag_argument_filters(tmp_path):
+    folder = str(tmp_path / "mixed")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    _insert_image(conn, "meme1", folder, "stock market numbers money")
+    _insert_image(conn, "shot1", folder, "stock market numbers dashboard")
+    _tag(conn, "meme1", "meme", 1)
+    _tag(conn, "shot1", "screenshot", 1)
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "stock market", tags={"meme"})
+    assert [h.image_id for h in hits] == ["meme1"]
+
+
+def test_facet_matches_second_ranked_tag(tmp_path):
+    """Rank <= 2 counts: label margins are narrow, so a strict argmax would
+    drop genuine charts."""
+    folder = str(tmp_path / "mixed")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    _insert_image(conn, "diagram1", folder, "retrieval filtering scoring ordering")
+    _tag(conn, "diagram1", "screenshot", 1)
+    _tag(conn, "diagram1", "chart", 2)
+    _tag(conn, "diagram1", "document", 3)
+    conn.commit()
+
+    assert [h.image_id for h in search_text(
+        conn, config, registry, folder, "retrieval", tags={"chart"})] == ["diagram1"]
+    # Rank 3 is beyond the cutoff.
+    assert search_text(conn, config, registry, folder, "retrieval", tags={"document"}) == []

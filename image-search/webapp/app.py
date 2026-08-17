@@ -76,16 +76,25 @@ def _hit_to_dict(hit: SearchHit) -> dict:
     }
 
 
+TAG_CHIPS = ("meme", "chart", "screenshot", "document", "photo", "art")
+
+
+def _tags_from_request() -> set[str]:
+    tag = request.args.get("tag", "").strip().lower()
+    return {tag} if tag in TAG_CHIPS else set()
+
+
 @app.route("/")
 def index():
     query = request.args.get("q", "").strip()
     folder = _folder_from_request()
+    tags = _tags_from_request()
     hits: list[SearchHit] = []
     error = None
     if query:
         conn = _db()
         try:
-            hits = search_text(conn, _config, _registry, folder, query, k=40)
+            hits = search_text(conn, _config, _registry, folder, query, k=40, tags=tags)
         except Exception as exc:  # noqa: BLE001 - surface to the page, don't 500
             error = str(exc)
         finally:
@@ -93,6 +102,7 @@ def index():
     return render_template(
         "index.html", query=query, hits=hits, error=error,
         folders=_folder_keys, folder=folder,
+        tag_chips=TAG_CHIPS, tag=(next(iter(tags)) if tags else ""),
     )
 
 
@@ -110,7 +120,7 @@ def similar(image_id: str):
         conn.close()
     return render_template(
         "index.html", query=f"(similar to {image_id[:8]})", hits=hits, error=error,
-        folders=_folder_keys, folder=folder,
+        folders=_folder_keys, folder=folder, tag_chips=TAG_CHIPS, tag="",
     )
 
 
@@ -125,15 +135,20 @@ def api_search():
     except ValueError:
         return jsonify({"ok": False, "error": "k must be an integer"}), 400
     k = max(1, min(100, k))
+    tags = _tags_from_request()
     conn = _db()
     try:
-        hits = search_text(conn, _config, _registry, folder, query, k=k)
+        hits = search_text(conn, _config, _registry, folder, query, k=k, tags=tags)
     except Exception as exc:  # noqa: BLE001 - JSON error for API callers, not an HTML 500
         return jsonify({"ok": False, "error": str(exc)}), 500
     finally:
         conn.close()
     return jsonify(
-        {"ok": True, "query": query, "folder": folder, "hits": [_hit_to_dict(h) for h in hits]}
+        {
+            "ok": True, "query": query, "folder": folder,
+            "tag": (next(iter(tags)) if tags else None),
+            "hits": [_hit_to_dict(h) for h in hits],
+        }
     )
 
 

@@ -6,18 +6,61 @@ from pathlib import Path
 
 import yaml
 
-# Processor keys read out of a folder's config block, in dispatch order
-# (text producers before text_embed — see processors/base.py TEXT_PRODUCER_KINDS).
+# Processor keys read out of a folder's config block, in dispatch order:
+#   image_embed -> tagger   : the tagger reuses the image vector, and its tags
+#                             gate the processors after it (route: auto).
+#   ocr/caption/topic_kw    : text producers, before text_embed which consumes
+#                             their output (see base.py TEXT_PRODUCER_KINDS).
 PROCESSOR_KEYS = (
+    "image_embed",
+    "tagger",
     "ocr",
     "caption",
     "topic_kw",
     "text_embed",
-    "image_embed",
     "faces",
-    "tagger",
     "layout",
 )
+
+# Non-processor keys allowed in a folder/override block.
+ROUTING_KEYS = ("route", "ocr_when", "caption_when")
+
+# Which zero-shot labels make a processor worth running (labels come from
+# processors/tagger.py LABEL_PROMPTS).
+#
+# OCR is inclusive — top-2 — because label margins are narrow and missing a
+# meme's text costs more than OCR-ing a stray photo.
+DEFAULT_OCR_WHEN = ("meme", "chart", "screenshot", "document")
+# Captioning runs on everything, text-bearing images included: a meme gets a
+# caption *and* OCR *and* an image vector, so it is findable by what it says,
+# what it looks like, and what it depicts. Narrow this list to trade recall
+# for indexing time.
+DEFAULT_CAPTION_WHEN = ("meme", "chart", "screenshot", "document", "photo", "art")
+OCR_RANK_CUTOFF = 2
+CAPTION_RANK_CUTOFF = 6  # i.e. any label — caption is never gated out by default
+
+
+@dataclass(frozen=True)
+class Routing:
+    """Per-image (rather than per-folder) processor gating, driven by the
+    tagger's zero-shot labels. `auto` off => every configured processor runs
+    on every file, exactly as before."""
+
+    auto: bool = False
+    ocr_when: tuple[str, ...] = DEFAULT_OCR_WHEN
+    caption_when: tuple[str, ...] = DEFAULT_CAPTION_WHEN
+
+    def wants(self, kind: str, ranked: list[tuple[str, float, int]]) -> bool:
+        """Should `kind` run, given this image's [(tag, score, rank)]?"""
+        if not self.auto or not ranked:
+            return True
+        if kind == "ocr":
+            labels, cutoff = self.ocr_when, OCR_RANK_CUTOFF
+        elif kind == "caption":
+            labels, cutoff = self.caption_when, CAPTION_RANK_CUTOFF
+        else:
+            return True
+        return any(tag in labels and rank <= cutoff for tag, _, rank in ranked)
 
 
 @dataclass(frozen=True)
@@ -28,6 +71,7 @@ class FolderConfig:
     # different pipeline than their siblings (e.g. nested "Screenshots" dirs
     # scattered inside otherwise-photo folders).
     overrides: dict[str, dict[str, str]] = field(default_factory=dict)
+    routing: Routing = field(default_factory=Routing)
 
     def enabled(self, kind: str) -> str | None:
         return self.processors.get(kind)
@@ -62,8 +106,33 @@ def _is_off(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "off"
 
 
+def _parse_routing(block: dict, context: str) -> Routing:
+    route = block.get("route")
+    auto = isinstance(route, str) and route.strip().lower() == "auto"
+    if route is not None and not auto:
+        raise ValueError(
+            f"route in {context} must be 'auto' (or omitted), got {route!r}"
+        )
+
+    def labels(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        value = block.get(key)
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValueError(f"{key} in {context} must be a list of label names, got {value!r}")
+        return tuple(value)
+
+    return Routing(
+        auto=auto,
+        ocr_when=labels("ocr_when", DEFAULT_OCR_WHEN),
+        caption_when=labels("caption_when", DEFAULT_CAPTION_WHEN),
+    )
+
+
 def _parse_processors(block: dict, defaults: dict[str, str], context: str) -> dict[str, str]:
-    unknown = set(block) - set(PROCESSOR_KEYS) - {"overrides"}
+    unknown = set(block) - set(PROCESSOR_KEYS) - set(ROUTING_KEYS) - {"overrides"}
     if unknown:
         warnings.warn(
             f"Unknown processor keys {sorted(unknown)} in {context} are ignored "
@@ -121,6 +190,7 @@ def load_config(path: str | Path) -> SearchConfig:
             path=Path(folder_key).expanduser(),
             processors=processors,
             overrides=overrides,
+            routing=_parse_routing(folder_raw, f"folder {folder_key!r}"),
         )
 
     config = SearchConfig(folders=folders)

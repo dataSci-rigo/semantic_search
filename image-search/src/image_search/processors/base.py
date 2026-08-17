@@ -21,6 +21,9 @@ class LoadedImage:
     # Text accumulated so far in this dispatch (from ocr/caption/topic_kw),
     # available to text_embed processors that run later in the same pass.
     text: str = ""
+    # Image vector produced by image_embed earlier in this dispatch, so the
+    # tagger can classify without a second vision forward pass.
+    image_vector: list[float] | None = None
 
 
 @dataclass(frozen=True)

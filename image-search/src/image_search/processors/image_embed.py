@@ -43,6 +43,14 @@ class SiglipImageEmbedProcessor:
         self._processor = AutoProcessor.from_pretrained(repo)
         self._model = AutoModel.from_pretrained(repo, **kwargs).to(self._device).eval()
 
+    @staticmethod
+    def _pooled(out):
+        """transformers <5 returns an output object with pooler_output; 5.x
+        returns the pooled tensor directly. Applies to both towers."""
+        import torch
+
+        return out if isinstance(out, torch.Tensor) else out.pooler_output
+
     def embed(self, path) -> list[float]:
         """Embed an image file (used for both indexing and query-by-image)."""
         self.load()
@@ -55,11 +63,23 @@ class SiglipImageEmbedProcessor:
             inputs = inputs.to(self._dtype)  # casts floating tensors only
         with torch.no_grad():
             out = self._model.get_image_features(**inputs)
-        # transformers <5 returns an output object with pooler_output; 5.x
-        # returns the pooled tensor directly.
-        feats = out if isinstance(out, torch.Tensor) else out.pooler_output
+        feats = self._pooled(out)
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats[0].float().cpu().tolist()
+
+    def embed_text(self, texts: list[str]) -> list[list[float]]:
+        """Embed text with the same model's text tower, into the same space as
+        embed(). Used for zero-shot tagging (processors/tagger.py); these
+        vectors are only ever compared against this model's image vectors."""
+        self.load()
+        import torch
+
+        inputs = self._processor(text=texts, return_tensors="pt", padding=True).to(self._device)
+        with torch.no_grad():
+            out = self._model.get_text_features(**inputs)
+        feats = self._pooled(out)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        return [row.float().cpu().tolist() for row in feats]
 
     def process(self, img: LoadedImage) -> list[Record]:
         return [ImageEmbedRecord(model=self.model_id, vector=self.embed(img.path))]

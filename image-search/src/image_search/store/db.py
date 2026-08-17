@@ -49,9 +49,11 @@ CREATE TABLE IF NOT EXISTS ocr_text (image_id TEXT, model TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS captions (image_id TEXT, model TEXT, text TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS text_fts USING fts5(image_id, text);
 
--- FREE outputs: tags. Continuous score; threshold at query time.
+-- FREE outputs: tags. Score is a raw cosine, which is NOT comparable across
+-- images — `rank` (1 = this image's best-matching label) is what search and
+-- routing filter on.
 CREATE TABLE IF NOT EXISTS tags (
-  image_id TEXT, tag TEXT, source TEXT, score REAL
+  image_id TEXT, tag TEXT, source TEXT, score REAL, rank INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 
@@ -110,6 +112,17 @@ def load_vec_extension(conn: sqlite3.Connection) -> None:
     conn.enable_load_extension(False)
 
 
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, decl: str
+) -> None:
+    """CREATE TABLE IF NOT EXISTS won't add a column to a table that already
+    exists, so columns added after a DB was first created need this."""
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _add_column_if_missing(conn, "tags", "rank", "INTEGER")
     conn.commit()

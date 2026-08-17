@@ -16,6 +16,11 @@
          padding: .7rem .6rem; color: #e2e8f0; font-size: .9rem; max-width: 12rem; }
   button { border: none; border-radius: 8px; padding: .7rem 1.1rem; font-size: .9rem;
            font-weight: 600; cursor: pointer; background: #1e3a5f; color: #7dd3fc; }
+  .chips { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1rem; }
+  .chip { font-size: .72rem; padding: .3rem .65rem; border-radius: 999px;
+          background: #1e293b; border: 1px solid #334155; color: #94a3b8;
+          text-decoration: none; }
+  .chip.on { background: #1e3a5f; border-color: #38bdf8; color: #7dd3fc; font-weight: 600; }
   .error { background: #7f1d1d; color: #f87171; border-radius: 8px; padding: .75rem;
            margin-bottom: 1rem; font-size: .85rem; }
   .empty { color: #64748b; font-size: .9rem; padding: 1rem 0; }
@@ -54,6 +59,15 @@
   {% endif %}
   <button type="submit">Search</button>
 </form>
+
+<div class="chips">
+  <a class="chip {% if not tag %}on{% endif %}"
+     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}">all</a>
+  {% for c in tag_chips %}
+  <a class="chip {% if tag == c %}on{% endif %}"
+     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}&tag={{ c }}">{{ c }}s</a>
+  {% endfor %}
+</div>
 
 {% if error %}
 <div class="error">{{ error }}</div>

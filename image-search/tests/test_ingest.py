@@ -11,6 +11,7 @@ from image_search.processors.base import (
     LoadedImage,
     OcrRecord,
     Record,
+    TagRecord,
     TextEmbedRecord,
 )
 from image_search.registry import Registry
@@ -710,3 +711,131 @@ def test_failing_folder_does_not_stop_other_folders(tmp_path, monkeypatch):
     assert "error" in stats[str(bad)]
     assert stats[str(good)]["indexed"] == 1
     assert conn.execute("SELECT COUNT(*) AS n FROM images").fetchone()["n"] == 1
+
+
+# ---- content-based routing --------------------------------------------------
+
+class FakeTagger:
+    """Emits a fixed label ranking per image id, so routing is deterministic."""
+
+    kind = "tagger"
+    model_id = "fake-clip"
+
+    def __init__(self, labels_by_id):
+        self.labels_by_id = labels_by_id
+
+    def load(self) -> None:
+        pass
+
+    def process(self, img: LoadedImage) -> list[Record]:
+        labels = self.labels_by_id.get(img.image_id, ["photo", "art"])
+        return [
+            TagRecord(tag=t, score=1.0 - i * 0.05, source="clip-zs")
+            for i, t in enumerate(labels)
+        ]
+
+
+class RecordingCaption(FakeCaption):
+    def __init__(self):
+        self.seen = []
+
+    def process(self, img: LoadedImage) -> list[Record]:
+        self.seen.append(img.image_id)
+        return super().process(img)
+
+
+class RecordingOcr(FakeOcr):
+    def __init__(self):
+        self.seen = []
+
+    def process(self, img: LoadedImage) -> list[Record]:
+        self.seen.append(img.image_id)
+        return super().process(img)
+
+
+def _routed_setup(tmp_path, labels_by_id_builder):
+    folder = tmp_path / "mixed"
+    folder.mkdir()
+    paths = {}
+    for name, color in (("meme", (200, 0, 0)), ("photo", (0, 120, 200))):
+        p = folder / f"{name}.png"
+        Image.new("RGB", (4, 4), color).save(p)
+        paths[name] = images_store.content_hash(p)
+
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        f'folders:\n  "{folder}":\n'
+        "    route: auto\n"
+        "    tagger: fake-clip\n"
+        "    ocr: fake-ocr\n"
+        "    caption: fake-caption\n"
+    )
+    config = load_config(config_path)
+
+    registry = Registry(config)
+    ocr, caption = RecordingOcr(), RecordingCaption()
+    registry._instances[("ocr", "fake-ocr")] = ocr
+    registry._instances[("caption", "fake-caption")] = caption
+    registry._instances[("tagger", "fake-clip")] = FakeTagger(
+        labels_by_id_builder(paths)
+    )
+    return folder, paths, config, registry, ocr, caption
+
+
+def test_routing_gives_text_images_ocr_and_caption_but_photos_only_caption(tmp_path):
+    folder, ids, config, registry, ocr, caption = _routed_setup(
+        tmp_path,
+        lambda p: {
+            p["meme"]: ["meme", "art"],
+            p["photo"]: ["photo", "art"],
+        },
+    )
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+
+    # The meme gets both text paths; the photo is captioned but not OCR'd.
+    assert ocr.seen == [ids["meme"]]
+    assert sorted(caption.seen) == sorted([ids["meme"], ids["photo"]])
+
+
+def test_routing_writes_ranked_tags(tmp_path):
+    folder, ids, config, registry, _, _ = _routed_setup(
+        tmp_path,
+        lambda p: {p["meme"]: ["meme", "chart"], p["photo"]: ["photo", "art"]},
+    )
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    ingest_folder(conn, config, registry, str(folder))
+
+    rows = conn.execute(
+        "SELECT tag, rank, source FROM tags WHERE image_id = ? ORDER BY rank",
+        (ids["meme"],),
+    ).fetchall()
+    assert [(r["tag"], r["rank"]) for r in rows] == [("meme", 1), ("chart", 2)]
+    assert {r["source"] for r in rows} == {"clip-zs"}
+
+
+def test_no_route_auto_runs_every_configured_processor(tmp_path):
+    """Without route: auto, behavior is exactly as before — no gating."""
+    folder = tmp_path / "mixed"
+    folder.mkdir()
+    p = folder / "photo.png"
+    Image.new("RGB", (4, 4), (0, 120, 200)).save(p)
+
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        f'folders:\n  "{folder}":\n    ocr: fake-ocr\n    caption: fake-caption\n'
+    )
+    config = load_config(config_path)
+    registry = Registry(config)
+    ocr, caption = RecordingOcr(), RecordingCaption()
+    registry._instances[("ocr", "fake-ocr")] = ocr
+    registry._instances[("caption", "fake-caption")] = caption
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    ingest_folder(conn, config, registry, str(folder))
+
+    assert len(ocr.seen) == 1 and len(caption.seen) == 1
