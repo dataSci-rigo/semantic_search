@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +24,7 @@ PROCESSOR_KEYS = (
 )
 
 # Non-processor keys allowed in a folder/override block.
-ROUTING_KEYS = ("route", "ocr_when", "caption_when")
+ROUTING_KEYS = ("route", "ocr_when", "caption_when", "exclude_patterns")
 
 # Which zero-shot labels make a processor worth running (labels come from
 # processors/tagger.py LABEL_PROMPTS).
@@ -72,9 +73,23 @@ class FolderConfig:
     # scattered inside otherwise-photo folders).
     overrides: dict[str, dict[str, str]] = field(default_factory=dict)
     routing: Routing = field(default_factory=Routing)
+    # Filename regexes whose PDFs are never indexed. Defaults to the
+    # financial/tax patterns — tax records shouldn't land behind the same
+    # search box as memes. Set `exclude_patterns: []` to index everything.
+    exclude_patterns: tuple[str, ...] | None = None
 
     def enabled(self, kind: str) -> str | None:
         return self.processors.get(kind)
+
+    def excludes_pdf(self, file_path: Path) -> bool:
+        from image_search import textitems
+
+        if self.exclude_patterns is None:
+            return textitems.looks_financial(file_path)
+        return any(
+            re.search(pattern, file_path.name, re.IGNORECASE)
+            for pattern in self.exclude_patterns
+        )
 
     def processors_for_path(self, file_path: Path) -> dict[str, str]:
         parts_lower = {p.lower() for p in file_path.parts}
@@ -129,6 +144,28 @@ def _parse_routing(block: dict, context: str) -> Routing:
         ocr_when=labels("ocr_when", DEFAULT_OCR_WHEN),
         caption_when=labels("caption_when", DEFAULT_CAPTION_WHEN),
     )
+
+
+def _parse_excludes(block: dict, context: str) -> tuple[str, ...] | None:
+    """None means "use the built-in financial/tax patterns"; an explicit list
+    (including an empty one) replaces them."""
+    value = block.get("exclude_patterns")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(
+            f"exclude_patterns in {context} must be a list of regexes, got {value!r}"
+        )
+    for pattern in value:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"exclude_patterns in {context} has invalid regex {pattern!r}: {exc}"
+            ) from exc
+    return tuple(value)
 
 
 def _parse_processors(block: dict, defaults: dict[str, str], context: str) -> dict[str, str]:
@@ -191,6 +228,7 @@ def load_config(path: str | Path) -> SearchConfig:
             processors=processors,
             overrides=overrides,
             routing=_parse_routing(folder_raw, f"folder {folder_key!r}"),
+            exclude_patterns=_parse_excludes(folder_raw, f"folder {folder_key!r}"),
         )
 
     config = SearchConfig(folders=folders)

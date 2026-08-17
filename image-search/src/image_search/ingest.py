@@ -65,6 +65,8 @@ def ingest_folder(
                 indexed = _ingest_note(conn, registry, folder, folder_key, path, mtime)
             elif suffix == textitems.LINKS_EXTENSION:
                 indexed = _ingest_links(conn, registry, folder, folder_key, path, mtime)
+            elif suffix == textitems.PDF_EXTENSION:
+                indexed = _ingest_pdf(conn, registry, folder, folder_key, path, mtime)
             else:
                 indexed = _ingest_image(conn, registry, folder, folder_key, path, mtime)
             stats["indexed" if indexed else "skipped"] += 1
@@ -163,7 +165,7 @@ def _ingest_links(
                 (path_str, folder_key, item_id),
             )
             continue
-        title, page_text = textitems.fetch_page(url)
+        title, page_text, status = textitems.fetch_page(url)
         body = "\n".join(part for part in (comment, page_text) if part)
         textitems.insert_item(
             conn,
@@ -175,10 +177,73 @@ def _ingest_links(
             url=url,
             body=body,
             text_embedder=embedder,
+            status=status,
         )
         added += 1
+        if status != textitems.STATUS_OK:
+            logger.info("link %s: %s (kept, excluded from search)", url, status)
     conn.commit()
     return added > 0 or bool(previous_ids - current_ids)
+
+
+def _ingest_pdf(
+    conn: sqlite3.Connection,
+    registry: Registry,
+    folder: FolderConfig,
+    folder_key: str,
+    path: Path,
+    mtime: float,
+) -> bool:
+    """Index a sample of a PDF's pages. Financial/tax documents are skipped by
+    filename — see textitems.FINANCIAL_PATTERNS and the exclude_patterns
+    folder option."""
+    if folder.excludes_pdf(path):
+        images_store.upsert_file(
+            conn, str(path), folder_key, textitems.note_id(path), mtime
+        )
+        conn.commit()
+        logger.info("pdf %s: excluded by pattern", path.name)
+        return False
+
+    item_id = textitems.note_id(path)  # content hash: same file, same item
+    images_store.upsert_file(conn, str(path), folder_key, item_id, mtime)
+    if conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
+        conn.commit()
+        return False
+
+    # Scanned pages have no text layer; reuse the folder's OCR processor when
+    # one is configured rather than requiring a second OCR setup.
+    ocr_model = folder.processors_for_path(path).get("ocr")
+    ocr_processor = registry.get("ocr", ocr_model) if ocr_model else None
+
+    title, body = textitems.parse_pdf(path, ocr_processor=ocr_processor)
+
+    # Second gate, on the text itself: filenames don't announce what a
+    # document contains. Only applies where the folder is using the built-in
+    # financial patterns — an explicit exclude_patterns list means the user
+    # has stated exactly what to skip.
+    if folder.exclude_patterns is None:
+        marker = textitems.content_looks_financial(title, body)
+        if marker is not None:
+            conn.commit()
+            logger.info("pdf %s: excluded, content matched %r", path.name, marker)
+            return False
+
+    status = textitems.STATUS_OK if body.strip() else textitems.STATUS_THIN
+    textitems.insert_item(
+        conn,
+        item_id=item_id,
+        kind="pdf",
+        folder=folder_key,
+        src_path=str(path),
+        title=title,
+        url=None,
+        body=body,
+        text_embedder=_text_embedder(registry, folder, path),
+        status=status,
+    )
+    conn.commit()
+    return True
 
 
 def _ingest_image(

@@ -81,7 +81,95 @@ async def on_message(message):
             await session.post(SAVE_URL, json={"text": content})
 ```
 
-## 4. Reddit saved posts (optional, UNTESTED scaffold)
+## 4. Browser bookmarks
+
+`scripts/import_bookmarks.py` reads Firefox, Chrome, Edge, and Brave and writes
+one de-duplicated `.links` file. Nothing is fetched at this stage — it is fast
+and offline.
+
+```bash
+python scripts/import_bookmarks.py ~/Saved/bookmarks.links --dry-run  # counts only
+python scripts/import_bookmarks.py ~/Saved/bookmarks.links
+python scripts/import_bookmarks.py out.links --browser firefox        # one browser
+```
+
+Firefox's `places.sqlite` is opened read-only through SQLite's `immutable=1`
+URI, so it works while Firefox is running and can't touch the profile.
+
+**De-duplication** compares a normalized form of each URL — lowercased host,
+no `www.`, no default port, no fragment, no tracking parameters (`utm_*`,
+`fbclid`, `gclid`, …), sorted query, no trailing slash. The *original* URL is
+what gets fetched; normalization is only for comparison. On this machine that
+collapsed **3,992 bookmarks to 2,134 unique** — 46% were duplicates across
+browsers.
+
+### What happens at index time
+
+Each link is embedded from its title and URL first, so it stays findable even
+if the page never loads. Then the fetch classifies it:
+
+| Outcome | `status` | Result |
+|---|---|---|
+| HTML with real text | `ok` | title, URL, and page text indexed |
+| 404 / timeout / DNS failure | `dead` | row kept, hidden from search |
+| Login, paywall, or captcha wall | `blocked` | title + URL only |
+| Under 200 characters of text | `thin` | title + URL only |
+| Local/private address, auth page, search results | `skipped` | never requested |
+
+Nothing you saved is deleted — non-`ok` rows stay in the `items` table and are
+simply excluded from results, so a wrong call here is visible and reversible:
+
+```sql
+SELECT status, COUNT(*) FROM items WHERE kind='link' GROUP BY status;
+```
+
+Fetching is polite by default: one request per host per second, a 10-second
+timeout, a 1 MB cap, and one retry.
+
+## 5. PDFs
+
+Any `.pdf` in a watched folder is indexed from a **5-page sample** — the first
+page plus an even spread to the last, since the opening pages of a long
+document are all front matter. Pages with no text layer (scans) are OCR'd with
+the folder's configured OCR model.
+
+**Financial and tax documents are excluded by default** — filenames matching
+`1099`, `W-2`, `1040`, `tax`, `statement`, `invoice`, `receipt`, `payroll`,
+`K-1`. Override per folder:
+
+```yaml
+folders:
+  "~/Papers":
+    exclude_patterns: ["^draft-"]   # replaces the financial defaults
+  "~/Everything":
+    exclude_patterns: []            # index all PDFs
+```
+
+Filename matching is imperfect in both directions — check the run log, which
+names every PDF it excluded.
+
+## 6. Bookshelf photos → book records
+
+`scripts/import_books.py` turns photos of your shelves into searchable books.
+
+```bash
+python scripts/import_books.py shelf1.jpg shelf2.jpg -o ~/Saved/books.links
+```
+
+Two stages, deliberately split:
+
+1. **Claude vision reads the spines** (`claude-opus-5`, structured outputs) and
+   returns a title, author, and confidence per book.
+2. **Open Library supplies the description** and subjects. The summary is
+   *looked up*, never recalled by a model — so an obscure title gets a real
+   description or none at all, instead of a confident invention.
+
+Anything below `--min-confidence` (default 0.7), or with no Open Library match,
+goes to a `.review.txt` file rather than into the index — a misread spine
+shouldn't become a phantom book. Reads `ANTHROPIC_API_KEY` from the
+environment or a `.env` (`--env-file`). Open Library needs no credentials.
+
+## 7. Reddit saved posts (optional, UNTESTED scaffold)
 
 `scripts/fetch_reddit_saved.py` pulls your saved posts into the drop folder
 (image posts are downloaded; text/link posts append to `saved.links`). It

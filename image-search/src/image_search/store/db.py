@@ -33,12 +33,16 @@ CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder);
 -- with images — the id columns there hold item ids just as well.
 CREATE TABLE IF NOT EXISTS items (
   id         TEXT PRIMARY KEY,   -- note: sha256 of file bytes; link: sha256("link:"+url)
-  kind       TEXT NOT NULL,      -- "note" | "link"
+  kind       TEXT NOT NULL,      -- "note" | "link" | "pdf" | "book"
   folder     TEXT NOT NULL,      -- config key this item belongs to
   src_path   TEXT NOT NULL,      -- the file it came from
   title      TEXT,
   url        TEXT,
   body       TEXT,
+  -- Fetch outcome for links: ok | dead | blocked | thin | skipped. Rows that
+  -- aren't "ok" are kept (so a bad filter is visible and reversible) but are
+  -- excluded from search results.
+  status     TEXT DEFAULT 'ok',
   created_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_items_folder ON items(folder);
@@ -125,4 +129,5 @@ def _add_column_if_missing(
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _add_column_if_missing(conn, "tags", "rank", "INTEGER")
+    _add_column_if_missing(conn, "items", "status", "TEXT DEFAULT 'ok'")
     conn.commit()

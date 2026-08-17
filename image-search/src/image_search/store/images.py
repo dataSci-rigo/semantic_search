@@ -36,9 +36,9 @@ def walk_candidates(folder_path: Path) -> list[tuple[Path, float]]:
     """Stat-only walk: (path, mtime) for every ingestible file (images plus
     note/.links text files), sorted by path. No hashing here — ingest hashes
     only paths whose mtime changed."""
-    from image_search.textitems import LINKS_EXTENSION, NOTE_EXTENSIONS
+    from image_search.textitems import LINKS_EXTENSION, NOTE_EXTENSIONS, PDF_EXTENSION
 
-    extensions = IMAGE_EXTENSIONS | NOTE_EXTENSIONS | {LINKS_EXTENSION}
+    extensions = IMAGE_EXTENSIONS | NOTE_EXTENSIONS | {LINKS_EXTENSION, PDF_EXTENSION}
     out: list[tuple[Path, float]] = []
     if not folder_path.exists():
         return out

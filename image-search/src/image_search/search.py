@@ -163,9 +163,12 @@ def search_text(
                     SearchHit(image_id=image_id, path=row["path"], score=score, source=source)
                 )
                 continue
+            # status filter: dead/blocked/thin links stay in the table (so a
+            # bad filter is auditable) but never surface as results.
             item = conn.execute(
                 "SELECT kind, src_path, title, url, substr(body, 1, 300) AS snippet "
-                "FROM items WHERE id = ? AND folder = ?",
+                "FROM items WHERE id = ? AND folder = ? "
+                "AND (status IS NULL OR status = 'ok')",
                 (image_id, folder_key),
             ).fetchone()
             if item is not None:

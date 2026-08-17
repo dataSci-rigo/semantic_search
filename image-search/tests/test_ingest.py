@@ -410,7 +410,9 @@ def test_deleted_file_prunes_vectors(tmp_path):
 # ---- notes & links ----------------------------------------------------------
 
 def _fake_fetch(url):
-    return "Example Domain", f"page text for {url}"
+    from image_search import textitems
+
+    return "Example Domain", f"page text for {url}", textitems.STATUS_OK
 
 
 def test_ingest_note_and_links_alongside_images(tmp_path, monkeypatch):
