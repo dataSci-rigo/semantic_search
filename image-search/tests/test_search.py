@@ -1,5 +1,7 @@
 import textwrap
 
+import pytest
+
 from image_search.config import load_config
 from image_search.registry import Registry
 from image_search.search import search_text
@@ -222,3 +224,102 @@ def test_facet_matches_second_ranked_tag(tmp_path):
         conn, config, registry, folder, "retrieval", tags={"chart"})] == ["diagram1"]
     # Rank 3 is beyond the cutoff.
     assert search_text(conn, config, registry, folder, "retrieval", tags={"document"}) == []
+
+
+def _insert_image_row(conn, image_id, folder):
+    conn.execute(
+        "INSERT INTO images (id, path, folder, content_hash, mtime, width, height, indexed_at) "
+        "VALUES (?, ?, ?, ?, 0, 4, 4, 0)",
+        (image_id, f"/x/{image_id}.png", folder, image_id),
+    )
+
+
+def _insert_fts(conn, image_id, text, source):
+    conn.execute(
+        "INSERT INTO text_fts (image_id, text, source) VALUES (?, ?, ?)",
+        (image_id, text, source),
+    )
+
+
+def test_field_ocr_only_excludes_caption_matches(tmp_path):
+    folder = str(tmp_path / "mixed")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    _insert_image_row(conn, "ocr1", folder)
+    _insert_image_row(conn, "cap1", folder)
+    _insert_fts(conn, "ocr1", "unemployment chart", "ocr")
+    _insert_fts(conn, "cap1", "unemployment chart", "caption")
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "unemployment", field="ocr")
+    assert [h.image_id for h in hits] == ["ocr1"]
+
+
+def test_field_caption_only_excludes_ocr_matches(tmp_path):
+    folder = str(tmp_path / "mixed")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    _insert_image_row(conn, "ocr1", folder)
+    _insert_image_row(conn, "cap1", folder)
+    _insert_fts(conn, "ocr1", "unemployment chart", "ocr")
+    _insert_fts(conn, "cap1", "unemployment chart", "caption")
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "unemployment", field="caption")
+    assert [h.image_id for h in hits] == ["cap1"]
+
+
+def test_field_none_returns_both(tmp_path):
+    folder = str(tmp_path / "mixed")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    _insert_image_row(conn, "ocr1", folder)
+    _insert_image_row(conn, "cap1", folder)
+    _insert_fts(conn, "ocr1", "unemployment chart", "ocr")
+    _insert_fts(conn, "cap1", "unemployment chart", "caption")
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "unemployment")
+    assert {h.image_id for h in hits} == {"ocr1", "cap1"}
+
+
+def test_field_does_not_hide_items(tmp_path):
+    folder = str(tmp_path / "mixed")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO items (id, kind, folder, src_path, title, url, body) "
+        "VALUES ('note1', 'note', ?, '/x/idea.md', 'Big Idea', NULL, 'unemployment thoughts')",
+        (folder,),
+    )
+    # No source column value given -> NULL, mirroring how textitems.py inserts items.
+    conn.execute(
+        "INSERT INTO text_fts (image_id, text) VALUES ('note1', 'unemployment thoughts')"
+    )
+    conn.commit()
+
+    for field in ("ocr", "caption"):
+        hits = search_text(conn, config, registry, folder, "unemployment", field=field)
+        assert [h.image_id for h in hits] == ["note1"]
+
+
+def test_invalid_field_raises(tmp_path):
+    folder = str(tmp_path / "shots")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    with pytest.raises(ValueError):
+        search_text(conn, config, registry, folder, "x", field="bogus")

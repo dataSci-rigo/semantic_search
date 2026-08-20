@@ -77,6 +77,7 @@ def _hit_to_dict(hit: SearchHit) -> dict:
 
 
 TAG_CHIPS = ("meme", "chart", "screenshot", "document", "photo", "art")
+FIELD_CHOICES = ("ocr", "caption")  # unset/anything else -> None ("all fields")
 
 
 def _tags_from_request() -> set[str]:
@@ -84,17 +85,25 @@ def _tags_from_request() -> set[str]:
     return {tag} if tag in TAG_CHIPS else set()
 
 
+def _field_from_request() -> str | None:
+    field = request.args.get("field", "").strip().lower()
+    return field if field in FIELD_CHOICES else None
+
+
 @app.route("/")
 def index():
     query = request.args.get("q", "").strip()
     folder = _folder_from_request()
     tags = _tags_from_request()
+    field = _field_from_request()
     hits: list[SearchHit] = []
     error = None
     if query:
         conn = _db()
         try:
-            hits = search_text(conn, _config, _registry, folder, query, k=40, tags=tags)
+            hits = search_text(
+                conn, _config, _registry, folder, query, k=40, tags=tags, field=field
+            )
         except Exception as exc:  # noqa: BLE001 - surface to the page, don't 500
             error = str(exc)
         finally:
@@ -103,6 +112,7 @@ def index():
         "index.html", query=query, hits=hits, error=error,
         folders=_folder_keys, folder=folder,
         tag_chips=TAG_CHIPS, tag=(next(iter(tags)) if tags else ""),
+        field=(field or ""),
     )
 
 
@@ -120,7 +130,7 @@ def similar(image_id: str):
         conn.close()
     return render_template(
         "index.html", query=f"(similar to {image_id[:8]})", hits=hits, error=error,
-        folders=_folder_keys, folder=folder, tag_chips=TAG_CHIPS, tag="",
+        folders=_folder_keys, folder=folder, tag_chips=TAG_CHIPS, tag="", field="",
     )
 
 
@@ -136,9 +146,12 @@ def api_search():
         return jsonify({"ok": False, "error": "k must be an integer"}), 400
     k = max(1, min(100, k))
     tags = _tags_from_request()
+    field = _field_from_request()
     conn = _db()
     try:
-        hits = search_text(conn, _config, _registry, folder, query, k=k, tags=tags)
+        hits = search_text(
+            conn, _config, _registry, folder, query, k=k, tags=tags, field=field
+        )
     except Exception as exc:  # noqa: BLE001 - JSON error for API callers, not an HTML 500
         return jsonify({"ok": False, "error": str(exc)}), 500
     finally:
@@ -147,6 +160,7 @@ def api_search():
         {
             "ok": True, "query": query, "folder": folder,
             "tag": (next(iter(tags)) if tags else None),
+            "field": field,
             "hits": [_hit_to_dict(h) for h in hits],
         }
     )

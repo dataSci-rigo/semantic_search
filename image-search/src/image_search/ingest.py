@@ -293,7 +293,7 @@ def _ingest_image(
                     (disc.image_id, processor.model_id, record.text),
                 )
                 conn.execute(
-                    "INSERT INTO text_fts (image_id, text) VALUES (?, ?)",
+                    "INSERT INTO text_fts (image_id, text, source) VALUES (?, ?, 'ocr')",
                     (disc.image_id, record.text),
                 )
                 accumulated_text = (accumulated_text + "\n" + record.text).strip()
@@ -303,7 +303,7 @@ def _ingest_image(
                     (disc.image_id, processor.model_id, record.text),
                 )
                 conn.execute(
-                    "INSERT INTO text_fts (image_id, text) VALUES (?, ?)",
+                    "INSERT INTO text_fts (image_id, text, source) VALUES (?, ?, 'caption')",
                     (disc.image_id, record.text),
                 )
                 accumulated_text = (accumulated_text + "\n" + record.text).strip()

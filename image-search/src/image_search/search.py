@@ -81,16 +81,30 @@ def _fts_match_expr(query: str) -> str:
     return " ".join(f'"{tok}"' for tok in tokens) if tokens else '""'
 
 
-def _fts_hits(conn: sqlite3.Connection, query: str, k: int) -> list[tuple[str, float]]:
+def _fts_hits(
+    conn: sqlite3.Connection, query: str, k: int, field: str | None = None
+) -> list[tuple[str, float]]:
     # FTS5 bm25(): more negative is more relevant; flip sign so higher = better.
-    rows = conn.execute(
-        """
-        SELECT image_id, bm25(text_fts) AS rank
-        FROM text_fts WHERE text_fts MATCH ?
-        ORDER BY rank LIMIT ?
-        """,
-        (_fts_match_expr(query), k),
-    ).fetchall()
+    if field is None:
+        rows = conn.execute(
+            """
+            SELECT image_id, bm25(text_fts) AS rank
+            FROM text_fts WHERE text_fts MATCH ?
+            ORDER BY rank LIMIT ?
+            """,
+            (_fts_match_expr(query), k),
+        ).fetchall()
+    else:
+        # NULL-source rows (items — notes/links) always pass through a field
+        # filter unfiltered: field-scoping is meaningless for a saved note.
+        rows = conn.execute(
+            """
+            SELECT image_id, bm25(text_fts) AS rank
+            FROM text_fts WHERE text_fts MATCH ? AND (source = ? OR source IS NULL)
+            ORDER BY rank LIMIT ?
+            """,
+            (_fts_match_expr(query), field, k),
+        ).fetchall()
     return [(r["image_id"], -r["rank"]) for r in rows]
 
 
@@ -102,22 +116,29 @@ def search_text(
     query: str,
     k: int = 20,
     tags: set[str] | None = None,
+    field: str | None = None,
 ) -> list[SearchHit]:
     """Hybrid text search within one folder (spec section 7.3): filter by
     image-type facets, then semantic rank via the folder's text_embed model,
     with an FTS5 keyword fallback for anything the embedding misses.
 
     Facets come from the query itself ("unemployment graphs" -> charts about
-    unemployment) or explicitly via `tags` from the UI."""
+    unemployment) or explicitly via `tags` from the UI. `field` ("ocr" |
+    "caption" | None) scopes the FTS keyword match to that text_fts source —
+    vector search stays whole-image, since there's only one combined text
+    embedding per image (no per-field embeddings)."""
+    if field is not None and field not in ("ocr", "caption"):
+        raise ValueError(f"field must be 'ocr', 'caption', or None, got {field!r}")
+
     folder = config.folders[folder_key]
     text_embed_model = folder.enabled("text_embed")
 
     explicit_tags = set(tags or set())
     semantic_text, parsed_tags = parse_facets(query)
     active_tags = explicit_tags | parsed_tags
-    # Over-fetch when filtering: the vector/FTS scans don't know about facets,
-    # so a plain k would often come back empty after filtering.
-    fetch_k = k * 5 if active_tags else k
+    # Over-fetch when filtering: the vector/FTS scans don't know about facets
+    # or field scoping, so a plain k would often come back empty after filtering.
+    fetch_k = k * 5 if (active_tags or field) else k
 
     allowed: set[str] | None = None
     if active_tags:
@@ -141,7 +162,7 @@ def search_text(
 
     seen = {image_id for image_id, _ in vector_hits}
     fts_hits = [
-        (iid, score) for iid, score in _fts_hits(conn, semantic_text, fetch_k)
+        (iid, score) for iid, score in _fts_hits(conn, semantic_text, fetch_k, field)
         if iid not in seen
     ]
 

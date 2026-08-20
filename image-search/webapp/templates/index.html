@@ -62,11 +62,20 @@
 
 <div class="chips">
   <a class="chip {% if not tag %}on{% endif %}"
-     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}">all</a>
+     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}&field={{ field }}">all</a>
   {% for c in tag_chips %}
   <a class="chip {% if tag == c %}on{% endif %}"
-     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}&tag={{ c }}">{{ c }}s</a>
+     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}&tag={{ c }}&field={{ field }}">{{ c }}s</a>
   {% endfor %}
+</div>
+
+<div class="chips">
+  <a class="chip {% if not field %}on{% endif %}"
+     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}&tag={{ tag }}">all fields</a>
+  <a class="chip {% if field == 'ocr' %}on{% endif %}"
+     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}&tag={{ tag }}&field=ocr">ocr only</a>
+  <a class="chip {% if field == 'caption' %}on{% endif %}"
+     href="/?q={{ query|urlencode }}&folder={{ folder|urlencode }}&tag={{ tag }}&field=caption">captions only</a>
 </div>
 
 {% if error %}

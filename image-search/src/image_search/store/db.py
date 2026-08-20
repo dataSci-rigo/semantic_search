@@ -51,7 +51,11 @@ CREATE INDEX IF NOT EXISTS idx_items_src_path ON items(src_path);
 -- FREE outputs: text. Multiple models may coexist (model column).
 CREATE TABLE IF NOT EXISTS ocr_text (image_id TEXT, model TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS captions (image_id TEXT, model TEXT, text TEXT);
-CREATE VIRTUAL TABLE IF NOT EXISTS text_fts USING fts5(image_id, text);
+-- source (UNINDEXED: a filter column, not tokenized/searchable) lets search
+-- scope keyword matches to "ocr" or "caption" text specifically. NULL for
+-- items (notes/links/pdfs) — field-scoping doesn't apply to those, so they
+-- pass through every field filter unfiltered. See search.py:search_text.
+CREATE VIRTUAL TABLE IF NOT EXISTS text_fts USING fts5(image_id, text, source UNINDEXED);
 
 -- FREE outputs: tags. Score is a raw cosine, which is NOT comparable across
 -- images — `rank` (1 = this image's best-matching label) is what search and
@@ -126,8 +130,42 @@ def _add_column_if_missing(
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
+def _migrate_text_fts_add_source(conn: sqlite3.Connection) -> None:
+    """FTS5 virtual tables can't ALTER TABLE ADD COLUMN, so a `text_fts`
+    predating the `source` column needs a full rebuild: rename, recreate with
+    the column, backfill by matching (image_id, text) against ocr_text /
+    captions (whichever the row's exact text came from — items get no match,
+    stay NULL), then drop the old table. Cheap even for tens of thousands of
+    rows; run once per DB, guarded by whether the column already exists."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(text_fts)")}
+    if "source" in existing:
+        return
+    conn.execute("ALTER TABLE text_fts RENAME TO text_fts_old")
+    conn.execute("CREATE VIRTUAL TABLE text_fts USING fts5(image_id, text, source UNINDEXED)")
+    conn.execute(
+        """
+        INSERT INTO text_fts (image_id, text, source)
+        SELECT
+          old.image_id,
+          old.text,
+          CASE
+            WHEN EXISTS (
+              SELECT 1 FROM ocr_text o WHERE o.image_id = old.image_id AND o.text = old.text
+            ) THEN 'ocr'
+            WHEN EXISTS (
+              SELECT 1 FROM captions c WHERE c.image_id = old.image_id AND c.text = old.text
+            ) THEN 'caption'
+            ELSE NULL
+          END
+        FROM text_fts_old old
+        """
+    )
+    conn.execute("DROP TABLE text_fts_old")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _add_column_if_missing(conn, "tags", "rank", "INTEGER")
     _add_column_if_missing(conn, "items", "status", "TEXT DEFAULT 'ok'")
+    _migrate_text_fts_add_source(conn)
     conn.commit()

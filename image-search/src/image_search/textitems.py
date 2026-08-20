@@ -426,6 +426,7 @@ def insert_item(
     )
     text = _searchable_text(title, url, body)
     if text:
+        # no source: field-scoping doesn't apply to notes/links
         conn.execute(
             "INSERT INTO text_fts (image_id, text) VALUES (?, ?)", (item_id, text)
         )
