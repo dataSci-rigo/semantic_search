@@ -38,6 +38,33 @@ FACET_KEYWORDS = {
 # raw cosines are not comparable across images, so rank is the filter.
 FACET_RANK_CUTOFF = 2
 
+# Guest mode: an image whose zero-shot `nsfw` label ranks this high is hidden.
+# Must stay 1: with only 7 labels, `nsfw` lands 2nd on most ordinary photos
+# (measured: rank<=2 would hide 6,731 of 10,208 — see tag-backfill's
+# spot-check output). Rank 1 means nsfw beat even the generic "photograph"
+# label, which is the actual signal.
+NSFW_EXCLUDE_RANK = 1
+
+
+def private_ids(conn: sqlite3.Connection, config: SearchConfig) -> set[str]:
+    """image_ids hidden in guest mode: everything under a `private:` path
+    pattern, plus anything the tagger flagged nsfw within the rank cutoff."""
+    ids: set[str] = set()
+    if config.private_patterns:
+        ids.update(
+            r["id"]
+            for r in conn.execute("SELECT id, path FROM images")
+            if config.is_private_path(r["path"])
+        )
+    ids.update(
+        r["image_id"]
+        for r in conn.execute(
+            "SELECT image_id FROM tags WHERE tag = 'nsfw' AND rank IS NOT NULL AND rank <= ?",
+            (NSFW_EXCLUDE_RANK,),
+        )
+    )
+    return ids
+
 
 def parse_facets(query: str) -> tuple[str, set[str]]:
     """Split a raw query into (semantic_text, facet tags). Words that name an
@@ -117,6 +144,7 @@ def search_text(
     k: int = 20,
     tags: set[str] | None = None,
     field: str | None = None,
+    exclude_ids: set[str] | None = None,
 ) -> list[SearchHit]:
     """Hybrid text search within one folder (spec section 7.3): filter by
     image-type facets, then semantic rank via the folder's text_embed model,
@@ -136,9 +164,10 @@ def search_text(
     explicit_tags = set(tags or set())
     semantic_text, parsed_tags = parse_facets(query)
     active_tags = explicit_tags | parsed_tags
-    # Over-fetch when filtering: the vector/FTS scans don't know about facets
-    # or field scoping, so a plain k would often come back empty after filtering.
-    fetch_k = k * 5 if (active_tags or field) else k
+    # Over-fetch when filtering: the vector/FTS scans don't know about facets,
+    # field scoping, or guest exclusions, so a plain k would often come back
+    # empty after filtering.
+    fetch_k = k * 5 if (active_tags or field or exclude_ids) else k
 
     allowed: set[str] | None = None
     if active_tags:
@@ -169,6 +198,10 @@ def search_text(
     if allowed is not None:
         vector_hits = [h for h in vector_hits if h[0] in allowed]
         fts_hits = [h for h in fts_hits if h[0] in allowed]
+
+    if exclude_ids:
+        vector_hits = [h for h in vector_hits if h[0] not in exclude_ids]
+        fts_hits = [h for h in fts_hits if h[0] not in exclude_ids]
 
     def rows_for(hits: list[tuple[str, float]], source: str) -> list[SearchHit]:
         out = []
@@ -216,6 +249,7 @@ def search_similar_images(
     folder_key: str,
     image_id: str,
     k: int = 20,
+    exclude_ids: set[str] | None = None,
 ) -> list[SearchHit]:
     """Reverse-image search (spec section 7.4): given an already-indexed
     image_id, find its nearest neighbors in the same (space, model)
@@ -232,12 +266,14 @@ def search_similar_images(
             "(index it first)"
         )
 
-    # Over-fetch by one since the query image itself is its own nearest neighbor.
-    raw = vectors_store.query_nearest(conn, "image", image_embed_model, query_vector, k=k + 1)
+    # Over-fetch by one since the query image itself is its own nearest
+    # neighbor, and more when guest exclusions will thin the results.
+    fetch_k = (k * 5 if exclude_ids else k) + 1
+    raw = vectors_store.query_nearest(conn, "image", image_embed_model, query_vector, k=fetch_k)
 
     out = []
     for iid, dist in raw:
-        if iid == image_id:
+        if iid == image_id or (exclude_ids and iid in exclude_ids):
             continue
         # Same folder post-filter as search_text's rows_for.
         row = conn.execute(

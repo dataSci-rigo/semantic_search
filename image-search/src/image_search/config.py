@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -102,6 +103,23 @@ class FolderConfig:
 @dataclass(frozen=True)
 class SearchConfig:
     folders: dict[str, FolderConfig] = field(default_factory=dict)
+    # Path globs whose images are hidden when the server runs in guest mode
+    # (top-level `private:` key in folders.yaml). Patterns are matched against
+    # the full expanded path; a bare directory pattern also hides everything
+    # beneath it.
+    private_patterns: tuple[str, ...] = ()
+
+    def is_private_path(self, path: str | Path) -> bool:
+        text = str(Path(path).expanduser())
+        for pattern in self.private_patterns:
+            if fnmatch.fnmatch(text, pattern):
+                return True
+            # "~/Pictures/private" (no glob) should cover its whole subtree.
+            if not any(ch in pattern for ch in "*?[") and text.startswith(
+                pattern.rstrip("/") + "/"
+            ):
+                return True
+        return False
 
     def active_processors(self) -> set[tuple[str, str]]:
         """Union of (kind, model_id) referenced by any active folder,
@@ -231,9 +249,22 @@ def load_config(path: str | Path) -> SearchConfig:
             exclude_patterns=_parse_excludes(folder_raw, f"folder {folder_key!r}"),
         )
 
-    config = SearchConfig(folders=folders)
+    config = SearchConfig(
+        folders=folders,
+        private_patterns=_parse_private(raw.get("private")),
+    )
     _validate(config)
     return config
+
+
+def _parse_private(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"top-level `private` must be a list of path globs, got {value!r}")
+    return tuple(str(Path(v).expanduser()) for v in value)
 
 
 def _validate(config: SearchConfig) -> None:

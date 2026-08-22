@@ -4,7 +4,7 @@ import pytest
 
 from image_search.config import load_config
 from image_search.registry import Registry
-from image_search.search import search_text
+from image_search.search import private_ids, search_text
 from image_search.store.db import connect, migrate
 
 
@@ -323,3 +323,78 @@ def test_invalid_field_raises(tmp_path):
     migrate(conn)
     with pytest.raises(ValueError):
         search_text(conn, config, registry, folder, "x", field="bogus")
+
+
+# ---- guest mode: private_ids + exclude_ids -------------------------------
+
+
+def make_config_with_private(tmp_path, folder, private_pattern):
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            folders:
+              "{folder}":
+                ocr: fake-ocr
+            private:
+              - "{private_pattern}"
+            """
+        )
+    )
+    return load_config(config_path)
+
+
+def test_private_ids_from_path_pattern(tmp_path):
+    folder = str(tmp_path / "shots")
+    config = make_config_with_private(tmp_path, folder, "/x/private")
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO images (id, path, folder, content_hash, mtime, width, height, indexed_at) "
+        "VALUES ('pub', '/x/beach.png', ?, 'pub', 0, 4, 4, 0)",
+        (folder,),
+    )
+    conn.execute(
+        "INSERT INTO images (id, path, folder, content_hash, mtime, width, height, indexed_at) "
+        "VALUES ('priv', '/x/private/beach.png', ?, 'priv', 0, 4, 4, 0)",
+        (folder,),
+    )
+    conn.commit()
+    assert private_ids(conn, config) == {"priv"}
+
+
+def test_private_ids_from_nsfw_tag_rank(tmp_path):
+    folder = str(tmp_path / "shots")
+    config = make_config_no_embed(tmp_path, folder)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO tags (image_id, tag, source, score, rank) "
+        "VALUES ('flagged', 'nsfw', 'clip-zs', 0.9, 1)"
+    )
+    # Below the cutoff: nsfw is merely somewhere in the ranking, not on top.
+    conn.execute(
+        "INSERT INTO tags (image_id, tag, source, score, rank) "
+        "VALUES ('fine', 'nsfw', 'clip-zs', 0.1, 5)"
+    )
+    conn.commit()
+    assert private_ids(conn, config) == {"flagged"}
+
+
+def test_exclude_ids_hides_hits(tmp_path):
+    folder = str(tmp_path / "shots")
+    config = make_config_no_embed(tmp_path, folder)
+    registry = Registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    _insert_image(conn, "img-keep", folder, "sunset at the beach")
+    _insert_image(conn, "img-hide", folder, "sunset at the beach")
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "sunset")
+    assert {h.image_id for h in hits} == {"img-keep", "img-hide"}
+
+    hits = search_text(
+        conn, config, registry, folder, "sunset", exclude_ids={"img-hide"}
+    )
+    assert [h.image_id for h in hits] == ["img-keep"]

@@ -46,7 +46,7 @@
 </head>
 <body>
 
-<h1>photo search</h1>
+<h1>photo search{% if guest %} <span style="background:#f59e0b;color:#111;border-radius:4px;padding:.1em .45em;font-size:.7em;vertical-align:middle;">GUEST</span>{% endif %}</h1>
 
 <form method="get" action="/">
   <input type="text" name="q" value="{{ query }}" placeholder="search your photos…" autofocus>

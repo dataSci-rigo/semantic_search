@@ -25,6 +25,8 @@ LABEL_PROMPTS: dict[str, str] = {
     "document": "a scanned document or page of text",
     "photo": "a photograph of a place or person",
     "art": "digital art or a drawing",
+    # Guest-mode exclusion (search.py NSFW_EXCLUDE_RANK), not a search facet.
+    "nsfw": "an explicit nude or pornographic photo",
 }
 
 

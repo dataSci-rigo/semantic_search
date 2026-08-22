@@ -14,9 +14,21 @@ folders:
   "~/Pictures":
     caption: moondream2
     image_embed: siglip2-base
+    # Zero-shot labels (incl. `nsfw` for guest mode) — reuses the image
+    # vector already computed in the same pass, so it's nearly free.
+    tagger: siglip2-base
     overrides:
       Screenshots:
         ocr: rapidocr
         # Overrides inherit defaults, so image_embed must be disabled
-        # explicitly to keep Screenshots OCR+text-search only.
+        # explicitly to keep Screenshots OCR+text-search only. The tagger
+        # would embed on demand without a vector, so it's off here too —
+        # guest mode covers screenshots via `private:` path rules only.
         image_embed: off
+        tagger: off
+
+# Path globs hidden when the web app runs in guest mode (--guest /
+# IMAGE_SEARCH_GUEST=1). A bare directory covers its whole subtree.
+# Example:
+#   - "~/Pictures/private"
+private: []

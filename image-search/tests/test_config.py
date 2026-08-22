@@ -190,3 +190,54 @@ def test_active_processors_includes_overrides(tmp_path):
         ("caption", "moondream2"),
         ("ocr", "rapidocr"),
     }
+
+
+def test_private_patterns_and_is_private_path(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        folders:
+          "~/Pictures":
+            ocr: rapidocr
+        private:
+          - "~/Pictures/private"
+          - "/mnt/vault/*.png"
+        """,
+    )
+    config = load_config(path)
+    home = str(Path("~").expanduser())
+    # A bare directory pattern covers its whole subtree.
+    assert config.is_private_path(f"{home}/Pictures/private/a/b.jpg")
+    assert config.is_private_path("~/Pictures/private/c.jpg")
+    assert not config.is_private_path(f"{home}/Pictures/beach.jpg")
+    # Glob patterns match with fnmatch semantics.
+    assert config.is_private_path("/mnt/vault/x.png")
+    assert not config.is_private_path("/mnt/vault/x.txt")
+
+
+def test_private_defaults_empty(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        folders:
+          "~/Pictures":
+            ocr: rapidocr
+        """,
+    )
+    config = load_config(path)
+    assert config.private_patterns == ()
+    assert not config.is_private_path("/anything/at/all.jpg")
+
+
+def test_private_rejects_non_list(tmp_path):
+    path = write_config(
+        tmp_path,
+        """
+        folders:
+          "~/Pictures":
+            ocr: rapidocr
+        private: 5
+        """,
+    )
+    with pytest.raises(ValueError):
+        load_config(path)

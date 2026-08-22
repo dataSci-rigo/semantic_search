@@ -99,6 +99,98 @@ def cmd_dupes(args: argparse.Namespace) -> None:
     print(f"\nDeleted {deleted} duplicate file(s); kept one copy per group.")
 
 
+def cmd_tag_backfill(args: argparse.Namespace) -> None:
+    """Tag already-indexed images from their stored image vectors — no vision
+    forward passes, just dot products against the label prompts. Images with
+    no stored vector (e.g. OCR-only screenshots) are skipped; guest mode
+    covers those via `private:` path rules instead."""
+    import struct
+
+    from image_search.processors.image_embed import SiglipImageEmbedProcessor
+    from image_search.processors.tagger import LABEL_PROMPTS, SOURCE
+    from image_search.store.db import load_vec_extension
+    from image_search.store.vectors import vec_table_name
+
+    config = load_config(args.config)
+    conn = connect(args.db)
+    migrate(conn)
+    load_vec_extension(conn)
+
+    models = {
+        folder.enabled("tagger") or folder.enabled("image_embed")
+        for folder in config.folders.values()
+    } - {None}
+    if not models:
+        print("No folder has a tagger or image_embed model configured; nothing to do.")
+        return
+
+    labels = list(LABEL_PROMPTS)
+    total = 0
+    nsfw_scored: list[tuple[float, str]] = []  # (nsfw score, path) for spot-checking
+    for model in sorted(models):
+        embedder = SiglipImageEmbedProcessor(model)
+        embedder.load()
+        label_vectors = embedder.embed_text(list(LABEL_PROMPTS.values()))
+
+        table = vec_table_name("image", model)
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not exists:
+            print(f"{model}: no {table} table in this index; skipping.")
+            continue
+        rows = conn.execute(
+            f"""
+            SELECT vm.image_id AS image_id, v.embedding AS embedding, img.path AS path
+            FROM vec_map vm
+            JOIN {table} v ON v.rowid = vm.rowid
+            JOIN images img ON img.id = vm.image_id
+            WHERE vm.vec_table = ?
+              AND vm.image_id NOT IN (SELECT DISTINCT image_id FROM tags)
+            """,
+            (table,),
+        ).fetchall()
+        print(f"{model}: {len(rows)} image(s) with a stored vector and no tags yet")
+
+        for row in rows:
+            raw = row["embedding"]
+            vector = struct.unpack(f"<{len(raw) // 4}f", raw)
+            scores = [
+                (tag, sum(a * b for a, b in zip(vector, label_vec)))
+                for tag, label_vec in zip(labels, label_vectors)
+            ]
+            ordered = sorted(scores, key=lambda s: s[1], reverse=True)
+            conn.executemany(
+                "INSERT INTO tags (image_id, tag, source, score, rank) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (row["image_id"], tag, SOURCE, score, i + 1)
+                    for i, (tag, score) in enumerate(ordered)
+                ],
+            )
+            nsfw_rank = next(i + 1 for i, (tag, _) in enumerate(ordered) if tag == "nsfw")
+            if nsfw_rank <= 3:
+                nsfw_score = dict(scores)["nsfw"]
+                nsfw_scored.append((nsfw_score, row["path"]))
+            total += 1
+            if total % 1000 == 0:
+                conn.commit()
+                print(f"  ...{total} tagged")
+    conn.commit()
+    print(f"\nTagged {total} image(s).")
+
+    if nsfw_scored:
+        nsfw_scored.sort(reverse=True)
+        print(
+            f"\n{len(nsfw_scored)} image(s) have nsfw in their top-3 labels. "
+            "Top 30 by score — spot-check these to calibrate NSFW_EXCLUDE_RANK "
+            "(guest mode hides rank <= 2):"
+        )
+        for score, path in nsfw_scored[:30]:
+            print(f"  {score:+.4f}  {path}")
+    else:
+        print("\nNo image ranked nsfw in its top-3 labels.")
+
+
 def cmd_cluster(args: argparse.Namespace) -> None:
     raise NotImplementedError("Face clustering lands in Phase 5 of the build spec.")
 
@@ -137,6 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete all but the first path in each group — removes files from disk!",
     )
     p_dupes.set_defaults(func=cmd_dupes)
+
+    p_backfill = sub.add_parser(
+        "tag-backfill",
+        help="Tag already-indexed images from stored vectors (for guest-mode nsfw filtering)",
+    )
+    p_backfill.set_defaults(func=cmd_tag_backfill)
 
     p_cluster = sub.add_parser("cluster", help="Re-cluster faces (not implemented yet)")
     p_cluster.set_defaults(func=cmd_cluster)

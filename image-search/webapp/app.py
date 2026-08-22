@@ -26,7 +26,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from image_search.config import load_config  # noqa: E402
 from image_search.registry import Registry  # noqa: E402
-from image_search.search import SearchHit, search_similar_images, search_text  # noqa: E402
+from image_search.search import (  # noqa: E402
+    SearchHit,
+    private_ids,
+    search_similar_images,
+    search_text,
+)
 from image_search.store.db import connect, migrate  # noqa: E402
 
 CONFIG_PATH = os.environ.get("IMAGE_SEARCH_CONFIG", str(PROJECT_ROOT / "config" / "folders.yaml"))
@@ -35,6 +40,9 @@ DB_PATH = os.environ.get(
 )
 PORT = int(os.environ.get("IMAGE_SEARCH_WEB_PORT", 9100))
 THUMB_SIZE = (480, 480)
+# Guest mode: hide private-path and nsfw-tagged images from every route.
+# Process-level by design — set at launch, no runtime toggle to spoof.
+GUEST = os.environ.get("IMAGE_SEARCH_GUEST") == "1" or "--guest" in sys.argv
 
 app = Flask(__name__)
 
@@ -61,6 +69,24 @@ def _db():
     # A fresh connection per request — sqlite3 connections aren't safe to
     # share across Flask's threaded request handling.
     return connect(DB_PATH)
+
+
+def _excluded(conn) -> set[str] | None:
+    """ids hidden this request: the guest-mode exclusion set, else None."""
+    return private_ids(conn, _config) if GUEST else None
+
+
+def _guard_private(image_id: str) -> None:
+    """404 direct image routes for hidden ids in guest mode — same response
+    as a nonexistent id, so guests can't probe what's being hidden."""
+    if not GUEST:
+        return
+    conn = _db()
+    try:
+        if image_id in private_ids(conn, _config):
+            abort(404)
+    finally:
+        conn.close()
 
 
 def _hit_to_dict(hit: SearchHit) -> dict:
@@ -102,7 +128,8 @@ def index():
         conn = _db()
         try:
             hits = search_text(
-                conn, _config, _registry, folder, query, k=40, tags=tags, field=field
+                conn, _config, _registry, folder, query, k=40, tags=tags, field=field,
+                exclude_ids=_excluded(conn),
             )
         except Exception as exc:  # noqa: BLE001 - surface to the page, don't 500
             error = str(exc)
@@ -112,16 +139,19 @@ def index():
         "index.html", query=query, hits=hits, error=error,
         folders=_folder_keys, folder=folder,
         tag_chips=TAG_CHIPS, tag=(next(iter(tags)) if tags else ""),
-        field=(field or ""),
+        field=(field or ""), guest=GUEST,
     )
 
 
 @app.route("/similar/<image_id>")
 def similar(image_id: str):
+    _guard_private(image_id)
     folder = _folder_from_request()
     conn = _db()
     try:
-        hits = search_similar_images(conn, _config, folder, image_id, k=40)
+        hits = search_similar_images(
+            conn, _config, folder, image_id, k=40, exclude_ids=_excluded(conn)
+        )
         error = None
     except ValueError as exc:
         hits = []
@@ -131,6 +161,7 @@ def similar(image_id: str):
     return render_template(
         "index.html", query=f"(similar to {image_id[:8]})", hits=hits, error=error,
         folders=_folder_keys, folder=folder, tag_chips=TAG_CHIPS, tag="", field="",
+        guest=GUEST,
     )
 
 
@@ -150,7 +181,8 @@ def api_search():
     conn = _db()
     try:
         hits = search_text(
-            conn, _config, _registry, folder, query, k=k, tags=tags, field=field
+            conn, _config, _registry, folder, query, k=k, tags=tags, field=field,
+            exclude_ids=_excluded(conn),
         )
     except Exception as exc:  # noqa: BLE001 - JSON error for API callers, not an HTML 500
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -214,6 +246,7 @@ def api_save():
 def image_thumb(image_id: str):
     from PIL import Image
 
+    _guard_private(image_id)
     conn = _db()
     try:
         row = conn.execute("SELECT path FROM images WHERE id = ?", (image_id,)).fetchone()
@@ -235,6 +268,7 @@ def image_thumb(image_id: str):
 
 @app.route("/full/<image_id>")
 def image_full(image_id: str):
+    _guard_private(image_id)
     conn = _db()
     try:
         row = conn.execute("SELECT path FROM images WHERE id = ?", (image_id,)).fetchone()
