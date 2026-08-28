@@ -52,6 +52,15 @@ class Registry:
                 self._instances[key] = constructors[kind](model_id)
         return self._instances[key]
 
+    def close_kind(self, kind: str) -> None:
+        """Shut down any worker subprocess backing this processor kind,
+        releasing its GPU memory. The instance stays cached — its bridge
+        relaunches the worker on next use — so this is safe to call at a
+        phase boundary even if a stray file of that kind shows up later."""
+        for (k, _model), proc in self._instances.items():
+            if k == kind and hasattr(proc, "close"):
+                proc.close()
+
     def for_processors(self, processors: dict[str, str]) -> list[tuple[str, Processor]]:
         """Resolve a processors dict (kind -> model_id) to instances, in
         dispatch order (PROCESSOR_KEYS already orders text producers before

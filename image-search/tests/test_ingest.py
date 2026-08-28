@@ -841,3 +841,50 @@ def test_no_route_auto_runs_every_configured_processor(tmp_path):
     ingest_folder(conn, config, registry, str(folder))
 
     assert len(ocr.seen) == 1 and len(caption.seen) == 1
+
+
+# ---- phased ingest: caption files first, worker released at the boundary ----
+
+
+def test_caption_files_process_first_and_worker_closes_at_boundary(tmp_path):
+    """The walk is phased so every caption-pipeline image runs before any
+    OCR-pipeline file, and the caption worker is closed exactly once, at the
+    phase boundary — that's what keeps both GPU-heavy workers from being
+    resident at the same time on the 8GB card."""
+    folder = tmp_path / "shots"
+    (folder / "Screenshots").mkdir(parents=True)
+    # Path-sorted walk would put Screenshots/a_shot.png before zz_photo.png;
+    # the phase sort must flip that.
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(folder / "Screenshots" / "a_shot.png")
+    Image.new("RGB", (4, 4), (0, 255, 0)).save(folder / "zz_photo.png")
+
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            folders:
+              "{folder}":
+                caption: fake-caption
+                overrides:
+                  Screenshots:
+                    ocr: fake-ocr
+            """
+        )
+    )
+    config = load_config(config_path)
+    registry = fake_registry(config)
+
+    order: list[str] = []
+    caption = registry._instances[("caption", "fake-caption")]
+    ocr = registry._instances[("ocr", "fake-ocr")]
+    caption_process, ocr_process = caption.process, ocr.process
+    caption.process = lambda img: (order.append("caption"), caption_process(img))[1]
+    ocr.process = lambda img: (order.append("ocr"), ocr_process(img))[1]
+    caption.close = lambda: order.append("close-caption")
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    stats = ingest_folder(conn, config, registry, str(folder))
+
+    assert stats["indexed"] == 2
+    assert order == ["caption", "close-caption", "ocr"]

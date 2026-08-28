@@ -45,11 +45,27 @@ def ingest_folder(
     walked = images_store.walk_candidates(folder.path)
     known = images_store.load_file_state(conn, folder_key)
 
+    # Phase the walk: caption-pipeline images first, everything else (OCR
+    # images, notes, links, PDFs) after. The path-sorted walk otherwise
+    # interleaves photo dirs with Screenshots dirs, keeping the caption
+    # worker (~5.4GB) and OCR worker (~1GB) resident on the GPU at the same
+    # time — which is what overflowed the 8GB card. The sort is stable, so
+    # path order is preserved within each phase; the caption worker is
+    # released at the boundary below.
+    walked.sort(key=lambda pm: _ingest_phase(folder, pm[0]))
+
     stats = {"seen": len(walked), "skipped": 0, "indexed": 0, "pruned": 0, "failed": 0}
     seen_paths: set[str] = set()
     failed_paths: list[str] = []
+    caption_phase_open = True
 
     for path, mtime in walked:
+        if caption_phase_open and _ingest_phase(folder, path) == 1:
+            # First non-caption file: every caption job is done for this
+            # folder. Free the worker's GPU memory before OCR starts.
+            registry.close_kind("caption")
+            caption_phase_open = False
+            logger.info("%s: caption phase done, released caption worker", folder_key)
         path_str = str(path)
         # Added before dispatch so a file that fails is never mistaken for a
         # deleted one and purged by prune_missing below.
@@ -89,6 +105,19 @@ def ingest_folder(
             ", ".join(failed_paths[:3]),
         )
     return stats
+
+
+def _ingest_phase(folder: FolderConfig, path: Path) -> int:
+    """0 = caption-pipeline image (GPU-heavy caption worker), 1 = everything
+    else. Non-image files are all phase 1 — notes/links are cheap, and PDFs
+    use the OCR worker, so they belong with the OCR phase."""
+    suffix = path.suffix.lower()
+    if suffix in textitems.NOTE_EXTENSIONS or suffix in (
+        textitems.LINKS_EXTENSION,
+        textitems.PDF_EXTENSION,
+    ):
+        return 1
+    return 0 if "caption" in folder.processors_for_path(path) else 1
 
 
 def _text_embedder(registry: Registry, folder: FolderConfig, path: Path):
