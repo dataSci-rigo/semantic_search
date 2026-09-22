@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import warnings
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -25,7 +26,22 @@ PROCESSOR_KEYS = (
 )
 
 # Non-processor keys allowed in a folder/override block.
-ROUTING_KEYS = ("route", "ocr_when", "caption_when", "exclude_patterns")
+ROUTING_KEYS = ("route", "ocr_when", "caption_when", "exclude_patterns", "exclude_dirs")
+
+# Directory names (case-insensitive fnmatch, matched per path component during
+# the walk) skipped by default: OS/recovery junk that fills external drives.
+# A folder's explicit `exclude_dirs:` list replaces this ([] walks everything).
+DEFAULT_EXCLUDE_DIRS = (
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "RECYCLER",
+    "RECYCLED",
+    "found.*",
+    ".Trash-*",
+    "lost+found",
+    "@eaDir",
+    ".git",
+)
 
 # Which zero-shot labels make a processor worth running (labels come from
 # processors/tagger.py LABEL_PROMPTS).
@@ -74,15 +90,18 @@ class FolderConfig:
     # scattered inside otherwise-photo folders).
     overrides: dict[str, dict[str, str]] = field(default_factory=dict)
     routing: Routing = field(default_factory=Routing)
-    # Filename regexes whose PDFs are never indexed. Defaults to the
-    # financial/tax patterns — tax records shouldn't land behind the same
-    # search box as memes. Set `exclude_patterns: []` to index everything.
+    # Filename regexes whose documents (.pdf/.docx/.csv/.xlsx) are never
+    # indexed. Defaults to the financial/tax patterns — tax records shouldn't
+    # land behind the same search box as memes. `exclude_patterns: []` indexes
+    # everything.
     exclude_patterns: tuple[str, ...] | None = None
+    # Directory names skipped during the walk; None means DEFAULT_EXCLUDE_DIRS.
+    exclude_dirs: tuple[str, ...] | None = None
 
     def enabled(self, kind: str) -> str | None:
         return self.processors.get(kind)
 
-    def excludes_pdf(self, file_path: Path) -> bool:
+    def excludes_document(self, file_path: Path) -> bool:
         from image_search import textitems
 
         if self.exclude_patterns is None:
@@ -91,6 +110,19 @@ class FolderConfig:
             re.search(pattern, file_path.name, re.IGNORECASE)
             for pattern in self.exclude_patterns
         )
+
+    def effective_exclude_dirs(self) -> tuple[str, ...]:
+        return DEFAULT_EXCLUDE_DIRS if self.exclude_dirs is None else self.exclude_dirs
+
+    def to_db_path(self, file_path: Path) -> str:
+        """Storage form of a path under this folder: POSIX-relative to the
+        root, so the index survives the root mounting somewhere else (or on
+        another OS)."""
+        return file_path.relative_to(self.path).as_posix()
+
+    def from_db_path(self, stored: str) -> Path:
+        """Machine-local absolute path for a stored relative path."""
+        return self.path / PurePosixPath(stored)
 
     def processors_for_path(self, file_path: Path) -> dict[str, str]:
         parts_lower = {p.lower() for p in file_path.parts}
@@ -108,6 +140,18 @@ class SearchConfig:
     # the full expanded path; a bare directory pattern also hides everything
     # beneath it.
     private_patterns: tuple[str, ...] = ()
+    # Top-level `db:` key — where this config wants its index to live.
+    # Relative values were already resolved against the config file's
+    # directory at load time, so a drive-resident config is self-describing.
+    db_path: Path | None = None
+
+    def resolve_stored(self, folder_key: str, stored: str) -> Path | None:
+        """Absolute local path for a stored (folder, relative-path) pair, or
+        None when the folder isn't in this config (treat as missing)."""
+        folder = self.folders.get(folder_key)
+        if folder is None:
+            return None
+        return folder.from_db_path(stored)
 
     def is_private_path(self, path: str | Path) -> bool:
         text = str(Path(path).expanduser())
@@ -186,8 +230,34 @@ def _parse_excludes(block: dict, context: str) -> tuple[str, ...] | None:
     return tuple(value)
 
 
+def _parse_exclude_dirs(block: dict, context: str) -> tuple[str, ...] | None:
+    """None means "use DEFAULT_EXCLUDE_DIRS"; an explicit list (including an
+    empty one) replaces them. Values are fnmatch patterns for directory
+    *names*, not paths."""
+    value = block.get("exclude_dirs")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(
+            f"exclude_dirs in {context} must be a list of directory-name patterns, got {value!r}"
+        )
+    return tuple(value)
+
+
+def _resolve_config_relative(raw: str, config_dir: Path) -> Path:
+    """Expand ~ and resolve a non-absolute path against the config file's
+    directory (normpath, not resolve(): a mount point must not be dereferenced
+    through symlinks, or the stored identity would change per machine)."""
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(os.path.normpath(config_dir / p))
+    return p
+
+
 def _parse_processors(block: dict, defaults: dict[str, str], context: str) -> dict[str, str]:
-    unknown = set(block) - set(PROCESSOR_KEYS) - set(ROUTING_KEYS) - {"overrides"}
+    unknown = set(block) - set(PROCESSOR_KEYS) - set(ROUTING_KEYS) - {"overrides", "path"}
     if unknown:
         warnings.warn(
             f"Unknown processor keys {sorted(unknown)} in {context} are ignored "
@@ -215,10 +285,18 @@ def _parse_processors(block: dict, defaults: dict[str, str], context: str) -> di
 
 def load_config(path: str | Path) -> SearchConfig:
     path = Path(path)
+    config_dir = path.resolve().parent
     raw = yaml.safe_load(path.read_text()) or {}
 
     defaults: dict[str, str] = raw.get("defaults", {}) or {}
     raw_folders: dict[str, dict] = raw.get("folders", {}) or {}
+
+    raw_db = raw.get("db")
+    db_path: Path | None = None
+    if raw_db is not None:
+        if not isinstance(raw_db, str):
+            raise ValueError(f"top-level `db` must be a path string, got {raw_db!r}")
+        db_path = _resolve_config_relative(raw_db, config_dir)
 
     unknown_defaults = set(defaults) - set(PROCESSOR_KEYS)
     if unknown_defaults:
@@ -241,30 +319,48 @@ def load_config(path: str | Path) -> SearchConfig:
             for name, block in overrides_raw.items()
         }
 
+        # The folder key is a stable logical name stored in the DB's `folder`
+        # columns; `path:` (relative values resolve against the config file's
+        # directory) says where the root lives on THIS machine. Legacy configs
+        # whose key IS the path keep working: no `path:` -> root = the key.
+        raw_root = folder_raw.get("path", folder_key)
+        if not isinstance(raw_root, str):
+            raise ValueError(
+                f"path in folder {folder_key!r} must be a string, got {raw_root!r}"
+            )
+
         folders[folder_key] = FolderConfig(
-            path=Path(folder_key).expanduser(),
+            path=_resolve_config_relative(raw_root, config_dir),
             processors=processors,
             overrides=overrides,
             routing=_parse_routing(folder_raw, f"folder {folder_key!r}"),
             exclude_patterns=_parse_excludes(folder_raw, f"folder {folder_key!r}"),
+            exclude_dirs=_parse_exclude_dirs(folder_raw, f"folder {folder_key!r}"),
         )
 
     config = SearchConfig(
         folders=folders,
-        private_patterns=_parse_private(raw.get("private")),
+        private_patterns=_parse_private(raw.get("private"), config_dir),
+        db_path=db_path,
     )
     _validate(config)
     return config
 
 
-def _parse_private(value: object) -> tuple[str, ...]:
+def _parse_private(value: object, config_dir: Path) -> tuple[str, ...]:
     if value is None:
         return ()
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ValueError(f"top-level `private` must be a list of path globs, got {value!r}")
-    return tuple(str(Path(v).expanduser()) for v in value)
+    # Non-absolute patterns anchor to the config dir, so a drive-resident
+    # config can write `private: [pictures/private]`.
+    out = []
+    for v in value:
+        p = Path(v).expanduser()
+        out.append(str(p) if p.is_absolute() else str(config_dir / p))
+    return tuple(out)
 
 
 def _validate(config: SearchConfig) -> None:

@@ -126,27 +126,47 @@ SELECT status, COUNT(*) FROM items WHERE kind='link' GROUP BY status;
 Fetching is polite by default: one request per host per second, a 10-second
 timeout, a 1 MB cap, and one retry.
 
-## 5. PDFs
+## 5. PDFs and office documents
 
-Any `.pdf` in a watched folder is indexed from a **5-page sample** — the first
-page plus an even spread to the last, since the opening pages of a long
-document are all front matter. Pages with no text layer (scans) are OCR'd with
-the folder's configured OCR model.
+Four document types become searchable items (deps: `pip install
+image-search[docs]`, i.e. pypdf + python-docx + openpyxl):
 
-**Financial and tax documents are excluded by default** — filenames matching
-`1099`, `W-2`, `1040`, `tax`, `statement`, `invoice`, `receipt`, `payroll`,
-`K-1`. Override per folder:
+- **`.pdf`** — indexed from a **5-page sample**: the first page plus an even
+  spread to the last, since the opening pages of a long document are all
+  front matter. Pages with no text layer (scans) are OCR'd with the folder's
+  configured OCR model (requires `pypdfium2` for page rendering; without it,
+  scanned pages are skipped).
+- **`.docx`** — title from the first Heading/Title paragraph (else document
+  metadata, else filename) plus the paragraph prose, capped at 20k chars.
+  Tables are skipped. Legacy `.doc` is not supported.
+- **`.csv`** — the filename and its **column names only. Row data is never
+  read into the index.** A file whose first row looks like data (no header)
+  is stored as a thin item and excluded from results.
+- **`.xlsx`** — workbook title plus one line per sheet: the sheet name and
+  its header row. **Data rows are never indexed.** Legacy `.xls` is not
+  supported.
+
+**Financial and tax documents are excluded by default**, for all four types —
+filenames matching `1099`, `W-2`, `1040`, `tax`, `statement`, `invoice`,
+`receipt`, `payroll`, `K-1` (so `statement.xlsx` is skipped just like
+`statement.pdf`), plus a second gate on the extracted text itself (account
+numbers, SSN patterns; for spreadsheets this covers headers like "routing
+number"). Override per folder:
 
 ```yaml
 folders:
   "~/Papers":
     exclude_patterns: ["^draft-"]   # replaces the financial defaults
   "~/Everything":
-    exclude_patterns: []            # index all PDFs
+    exclude_patterns: []            # index all documents
 ```
 
 Filename matching is imperfect in both directions — check the run log, which
-names every PDF it excluded.
+names every document it excluded.
+
+Note for pre-existing indexes: deleted PDFs used to leave orphaned items
+behind; the first ingest after this change prunes them (a one-time bump in
+the `pruned` count).
 
 ## 6. Bookshelf photos → book records
 

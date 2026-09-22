@@ -1,3 +1,4 @@
+import pytest
 from PIL import Image
 
 from image_search.store import images as images_store
@@ -33,8 +34,26 @@ def test_walk_candidates_is_stat_only_and_filters_extensions(tmp_path):
         assert mtime == path.stat().st_mtime
 
 
-def test_walk_candidates_missing_folder_returns_empty(tmp_path):
-    assert images_store.walk_candidates(tmp_path / "does-not-exist") == []
+def test_walk_candidates_missing_folder_raises(tmp_path):
+    # An empty return would read as "everything was deleted" and let
+    # prune_missing wipe the folder's index when its drive is unplugged.
+    with pytest.raises(FileNotFoundError):
+        images_store.walk_candidates(tmp_path / "does-not-exist")
+
+
+def test_walk_candidates_skips_excluded_dirs(tmp_path):
+    root = tmp_path / "drive"
+    (root / "photos").mkdir(parents=True)
+    (root / "$RECYCLE.BIN" / "sub").mkdir(parents=True)
+    (root / ".trash-1000").mkdir()  # case-insensitive match of .Trash-*
+    make_image(root / "photos" / "keep.png")
+    make_image(root / "$RECYCLE.BIN" / "sub" / "junk.png")
+    make_image(root / ".trash-1000" / "junk2.png")
+
+    walked = images_store.walk_candidates(
+        root, exclude_dirs=("$RECYCLE.BIN", ".Trash-*")
+    )
+    assert [p.name for p, _ in walked] == ["keep.png"]
 
 
 def test_describe_hashes_and_reads_dims(tmp_path):
@@ -74,8 +93,8 @@ def test_upsert_is_idempotent_on_content_id(tmp_path):
     [(path, mtime)] = images_store.walk_candidates(folder)
     disc = images_store.describe(path, "shots", mtime)
 
-    images_store.upsert_image(conn, disc)
-    images_store.upsert_image(conn, disc)
+    images_store.upsert_image(conn, disc, "one.png")
+    images_store.upsert_image(conn, disc, "one.png")
     conn.commit()
 
     count = conn.execute("SELECT COUNT(*) AS n FROM images").fetchone()["n"]
@@ -106,9 +125,9 @@ def test_duplicate_groups(tmp_path):
     conn = connect(tmp_path / "test.db")
     migrate(conn)
 
-    images_store.upsert_file(conn, "/x/b.png", "f", "dup-id", 1.0)
-    images_store.upsert_file(conn, "/x/a.png", "f", "dup-id", 1.0)
-    images_store.upsert_file(conn, "/x/unique.png", "f", "other-id", 1.0)
+    images_store.upsert_file(conn, "x/b.png", "f", "dup-id", 1.0)
+    images_store.upsert_file(conn, "x/a.png", "f", "dup-id", 1.0)
+    images_store.upsert_file(conn, "x/unique.png", "f", "other-id", 1.0)
 
     groups = images_store.duplicate_groups(conn)
-    assert groups == [("dup-id", ["/x/a.png", "/x/b.png"])]
+    assert groups == [("dup-id", [("f", "x/a.png"), ("f", "x/b.png")])]

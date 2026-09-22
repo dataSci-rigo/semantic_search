@@ -1,0 +1,22 @@
+# WSL view of the Windows Pictures library. The Windows twin is
+# pictures-windows.yaml — same folder NAME (`pictures`) and same DB file, so
+# either side can ingest and either side can search.
+db: /mnt/c/Users/rluna/.image-search/pictures.db
+
+defaults:
+  text_embed: bge-small-en-v1.5
+
+folders:
+  pictures:
+    path: /mnt/c/Users/rluna/Pictures
+    # TinyCLIP: small enough for a <3GB CPU-only host (pair with
+    # IMAGE_SEARCH_TORCH_DTYPE=bfloat16). The tagger reuses its vectors.
+    image_embed: wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M
+    tagger: wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M
+    ocr: rapidocr
+    caption: blip-base
+    # Tagger-gated per image: memes/charts/screenshots/documents get caption
+    # AND OCR; photos/art get caption only (DEFAULT_OCR_WHEN/CAPTION_WHEN).
+    route: auto
+
+private: []

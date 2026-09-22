@@ -11,13 +11,15 @@ from image_search.store import vectors as vectors_store
 @dataclass(frozen=True)
 class SearchHit:
     image_id: str
-    path: str  # image path, or the note/.links file the item came from
-    # Higher is better within a source ("vector": -distance, "fts": -bm25);
-    # scores are NOT comparable across sources — results are concatenated,
-    # vector hits first.
+    # Machine-local absolute path (resolved from the stored folder-relative
+    # form): the image, or the note/.links/document file the item came from.
+    path: str
+    # Higher is better within a source ("vector"/"clip": -distance,
+    # "fts": -bm25); scores are NOT comparable across sources — results are
+    # concatenated, vector hits first.
     score: float
-    source: str  # "vector" | "fts"
-    kind: str = "image"  # "image" | "note" | "link"
+    source: str  # "vector" | "fts" | "clip"
+    kind: str = "image"  # "image" | "note" | "link" | "pdf" | "docx" | "csv" | "xlsx"
     title: str | None = None
     url: str | None = None
     snippet: str | None = None
@@ -48,14 +50,16 @@ NSFW_EXCLUDE_RANK = 1
 
 def private_ids(conn: sqlite3.Connection, config: SearchConfig) -> set[str]:
     """image_ids hidden in guest mode: everything under a `private:` path
-    pattern, plus anything the tagger flagged nsfw within the rank cutoff."""
+    pattern, plus anything the tagger flagged nsfw within the rank cutoff.
+    Stored paths are folder-relative; they resolve to absolute before the
+    pattern match, and rows whose folder isn't in this config fail CLOSED
+    (hidden) — an unresolvable path can't be shown to a guest."""
     ids: set[str] = set()
     if config.private_patterns:
-        ids.update(
-            r["id"]
-            for r in conn.execute("SELECT id, path FROM images")
-            if config.is_private_path(r["path"])
-        )
+        for r in conn.execute("SELECT id, path, folder FROM images"):
+            resolved = config.resolve_stored(r["folder"], r["path"])
+            if resolved is None or config.is_private_path(resolved):
+                ids.add(r["id"])
     ids.update(
         r["image_id"]
         for r in conn.execute(
@@ -194,27 +198,51 @@ def search_text(
         (iid, score) for iid, score in _fts_hits(conn, semantic_text, fetch_k, field)
         if iid not in seen
     ]
+    seen.update(iid for iid, _ in fts_hits)
+
+    # Third source: the image-embed model's own text tower, queried against
+    # the image vectors (CLIP-family towers share one space). This is what
+    # finds images that have no OCR/caption text at all — essential on
+    # machines where those workers don't run.
+    clip_hits: list[tuple[str, float]] = []
+    image_embed_model = folder.enabled("image_embed")
+    if image_embed_model:
+        image_embedder = registry.get("image_embed", image_embed_model)
+        clip_vector = image_embedder.embed_text([semantic_text])[0]  # type: ignore[attr-defined]
+        raw = vectors_store.query_nearest(
+            conn, "image", image_embed_model, clip_vector, k=fetch_k
+        )
+        clip_hits = [(iid, -dist) for iid, dist in raw if iid not in seen]
 
     if allowed is not None:
         vector_hits = [h for h in vector_hits if h[0] in allowed]
         fts_hits = [h for h in fts_hits if h[0] in allowed]
+        clip_hits = [h for h in clip_hits if h[0] in allowed]
 
     if exclude_ids:
         vector_hits = [h for h in vector_hits if h[0] not in exclude_ids]
         fts_hits = [h for h in fts_hits if h[0] not in exclude_ids]
+        clip_hits = [h for h in clip_hits if h[0] not in exclude_ids]
 
     def rows_for(hits: list[tuple[str, float]], source: str) -> list[SearchHit]:
         out = []
         for image_id, score in hits:
             # Post-filter to the requested folder: the FTS/vector queries scan
             # every folder's rows, so fewer than k hits may survive. An id
-            # resolves either to an image or to a note/link item.
+            # resolves either to an image or to a note/link/document item.
+            # Stored paths are folder-relative; hits carry the resolved
+            # machine-local absolute path.
             row = conn.execute(
                 "SELECT path FROM images WHERE id = ? AND folder = ?", (image_id, folder_key)
             ).fetchone()
             if row is not None:
                 out.append(
-                    SearchHit(image_id=image_id, path=row["path"], score=score, source=source)
+                    SearchHit(
+                        image_id=image_id,
+                        path=str(folder.from_db_path(row["path"])),
+                        score=score,
+                        source=source,
+                    )
                 )
                 continue
             # status filter: dead/blocked/thin links stay in the table (so a
@@ -229,7 +257,7 @@ def search_text(
                 out.append(
                     SearchHit(
                         image_id=image_id,
-                        path=item["src_path"],
+                        path=str(folder.from_db_path(item["src_path"])),
                         score=score,
                         source=source,
                         kind=item["kind"],
@@ -240,7 +268,11 @@ def search_text(
                 )
         return out
 
-    return (rows_for(vector_hits, "vector") + rows_for(fts_hits, "fts"))[:k]
+    return (
+        rows_for(vector_hits, "vector")
+        + rows_for(fts_hits, "fts")
+        + rows_for(clip_hits, "clip")
+    )[:k]
 
 
 def search_similar_images(
@@ -281,5 +313,12 @@ def search_similar_images(
         ).fetchone()
         if row is None:
             continue
-        out.append(SearchHit(image_id=iid, path=row["path"], score=-dist, source="vector"))
+        out.append(
+            SearchHit(
+                image_id=iid,
+                path=str(folder.from_db_path(row["path"])),
+                score=-dist,
+                source="vector",
+            )
+        )
     return out[:k]

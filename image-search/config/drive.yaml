@@ -1,0 +1,32 @@
+# TEMPLATE for the external drive's self-describing config. Copy this file to
+# <drive>/.semantic_search/folders.yaml (e.g. /mnt/d/.semantic_search/ on this
+# machine, D:\.semantic_search\ on Windows). Both `db:` and `path:` are
+# RELATIVE — they resolve against the config file's own directory, so the same
+# file works wherever the drive mounts, on any machine or OS.
+db: index.db          # -> <drive>/.semantic_search/index.db
+
+defaults:
+  text_embed: bge-small-en-v1.5
+
+folders:
+  drive:
+    path: ..          # the drive root, relative to .semantic_search/
+    image_embed: wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M
+    tagger: wkcn/TinyCLIP-ViT-8M-16-Text-3M-YFCC15M
+    ocr: rapidocr
+    caption: blip-base
+    route: auto
+    # The built-in exclude_dirs default already skips $RECYCLE.BIN, System
+    # Volume Information, found.*, RECYCLER, RECYCLED, .Trash-*, lost+found.
+    # Uncomment to also skip the backup mirrors (roughly halves index time):
+    # exclude_dirs:
+    #   - "$RECYCLE.BIN"
+    #   - "System Volume Information"
+    #   - "found.*"
+    #   - "RECYCLER"
+    #   - "RECYCLED"
+    #   - ".Trash-*"
+    #   - "backup"
+    #   - "backup4ATE"
+
+private: []

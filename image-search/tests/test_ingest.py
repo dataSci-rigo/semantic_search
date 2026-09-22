@@ -514,6 +514,9 @@ def test_deleted_links_file_prunes_its_items(tmp_path, monkeypatch):
     folder.mkdir()
     links = folder / "saved.links"
     links.write_text("https://example.com/a\n")
+    # A second file keeps the post-delete walk non-empty, so the prune isn't
+    # blocked by the empty-walk (unplugged drive?) guard.
+    Image.new("RGB", (4, 4)).save(folder / "keep.png")
 
     config = make_config(tmp_path, str(folder), with_ocr=False, with_text_embed=False)
     registry = fake_registry(config)
@@ -699,10 +702,10 @@ def test_failing_folder_does_not_stop_other_folders(tmp_path, monkeypatch):
 
     real_walk = images_store.walk_candidates
 
-    def exploding_walk(folder_path):
+    def exploding_walk(folder_path, exclude_dirs=()):
         if folder_path == bad:
             raise PermissionError("simulated unreadable folder")
-        return real_walk(folder_path)
+        return real_walk(folder_path, exclude_dirs)
 
     monkeypatch.setattr(ingest_mod.images_store, "walk_candidates", exploding_walk)
 
@@ -888,3 +891,116 @@ def test_caption_files_process_first_and_worker_closes_at_boundary(tmp_path):
 
     assert stats["indexed"] == 2
     assert order == ["caption", "close-caption", "ocr"]
+
+
+# --- portable index: relative paths, relocation, unplug safety ---------------
+
+
+def test_stored_paths_are_folder_relative(tmp_path):
+    folder = tmp_path / "shots"
+    (folder / "nested").mkdir(parents=True)
+    Image.new("RGB", (4, 4)).save(folder / "nested" / "one.png")
+    (folder / "note.md").write_text("# n\nbody\n")
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    ingest_folder(conn, config, registry, str(folder))
+
+    file_paths = {r["path"] for r in conn.execute("SELECT path FROM files")}
+    assert file_paths == {"nested/one.png", "note.md"}
+    image_paths = {r["path"] for r in conn.execute("SELECT path FROM images")}
+    assert image_paths == {"nested/one.png"}
+    item_paths = {r["src_path"] for r in conn.execute("SELECT src_path FROM items")}
+    assert item_paths == {"note.md"}
+
+
+def _drive_style_config(drive_root):
+    """A drive-resident config: <drive>/.semantic_search/folders.yaml with a
+    named folder whose path is relative to the config dir."""
+    meta = drive_root / ".semantic_search"
+    meta.mkdir(parents=True, exist_ok=True)
+    config_path = meta / "folders.yaml"
+    config_path.write_text(
+        "db: index.db\nfolders:\n  drive:\n    path: ..\n    ocr: fake-ocr\n"
+    )
+    return config_path
+
+
+def test_index_survives_root_relocation(tmp_path):
+    """The core portability property: index under one mount point, remount
+    (rename) the root elsewhere, reload the drive-resident config — every
+    file stat-skips and search-facing rows resolve at the new location."""
+    drive_a = tmp_path / "mountA"
+    (drive_a / "pics").mkdir(parents=True)
+    img = drive_a / "pics" / "one.png"
+    Image.new("RGB", (4, 4)).save(img)
+    mtime = img.stat().st_mtime
+
+    config_path = _drive_style_config(drive_a)
+    config = load_config(config_path)
+    registry = fake_registry(config)
+    conn = connect(config.db_path)
+    migrate(conn)
+    first = ingest_folder(conn, config, registry, "drive")
+    assert first["indexed"] == 1
+    conn.close()
+
+    # "Remount" the drive somewhere else, preserving mtimes (rename does).
+    drive_b = tmp_path / "mountB"
+    drive_a.rename(drive_b)
+
+    config2 = load_config(drive_b / ".semantic_search" / "folders.yaml")
+    assert config2.folders["drive"].path == drive_b.resolve()
+    registry2 = fake_registry(config2)
+    conn2 = connect(config2.db_path)
+    migrate(conn2)
+    second = ingest_folder(conn2, config2, registry2, "drive")
+    assert second["skipped"] == 1 and second["indexed"] == 0 and second["pruned"] == 0
+    assert (drive_b / "pics" / "one.png").stat().st_mtime == mtime
+
+
+def test_missing_root_keeps_index_intact(tmp_path):
+    """An unmounted/deleted root must not prune anything."""
+    import shutil
+
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    Image.new("RGB", (4, 4)).save(folder / "one.png")
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    ingest_folder(conn, config, registry, str(folder))
+    assert _counts(conn, "files", "images") == {"files": 1, "images": 1}
+
+    shutil.rmtree(folder)
+    stats = ingest_folder(conn, config, registry, str(folder))
+    assert "error" in stats and stats["pruned"] == 0
+    assert _counts(conn, "files", "images") == {"files": 1, "images": 1}
+
+
+def test_empty_walk_with_known_files_skips_prune(tmp_path):
+    """Root exists but yields nothing (e.g. remounted empty): prune is held
+    back unless explicitly forced."""
+    folder = tmp_path / "shots"
+    folder.mkdir()
+    doomed = folder / "one.png"
+    Image.new("RGB", (4, 4)).save(doomed)
+
+    config = make_config(tmp_path, str(folder), with_text_embed=False)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    ingest_folder(conn, config, registry, str(folder))
+
+    doomed.unlink()  # folder is now empty but still exists
+    held = ingest_folder(conn, config, registry, str(folder))
+    assert held["pruned"] == 0
+    assert _counts(conn, "images")["images"] == 1
+
+    forced = ingest_folder(conn, config, registry, str(folder), allow_empty_prune=True)
+    assert forced["pruned"] == 1
+    assert _counts(conn, "images")["images"] == 0

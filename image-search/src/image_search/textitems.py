@@ -22,6 +22,21 @@ from pathlib import Path
 NOTE_EXTENSIONS = {".md", ".txt"}
 LINKS_EXTENSION = ".links"
 PDF_EXTENSION = ".pdf"
+DOCX_EXTENSION = ".docx"
+CSV_EXTENSION = ".csv"
+XLSX_EXTENSION = ".xlsx"
+# suffix -> items.kind for one-file-one-item, content-addressed documents.
+# Legacy .doc/.xls (OLE binary) are deliberately absent — unsupported, and
+# their extensions never enter the walk.
+DOCUMENT_KINDS = {
+    PDF_EXTENSION: "pdf",
+    DOCX_EXTENSION: "docx",
+    CSV_EXTENSION: "csv",
+    XLSX_EXTENSION: "xlsx",
+}
+XLSX_SHEET_CAP = 20
+CSV_SNIFF_BYTES = 8192
+CSV_BODY_CAP = 2000  # column names only — guards a "CSV" that is one giant line
 
 FETCH_TIMEOUT = 10
 FETCH_BODY_CAP = 5000
@@ -275,6 +290,8 @@ def fetch_page(url: str) -> tuple[str | None, str, str]:
 # \b would not match there.
 _NOT_ALNUM = r"(?<![a-z0-9])"
 _NOT_ALNUM_AFTER = r"(?![a-z0-9])"
+DOC_BODY_CAP = 20000  # shared body cap for pdf/docx extraction
+
 FINANCIAL_PATTERNS = (
     r"1099",
     rf"{_NOT_ALNUM}w-?2{_NOT_ALNUM_AFTER}",
@@ -360,7 +377,90 @@ def parse_pdf(path: Path, ocr_processor=None) -> tuple[str, str]:
 
     body = "\n".join(chunks).strip()
     title = meta_title or path.stem
-    return title, body[:FETCH_BODY_CAP * 4]
+    return title, body[:DOC_BODY_CAP]
+
+
+def parse_docx(path: Path) -> tuple[str, str]:
+    """(title, body) from a .docx: title is the first Heading/Title-styled
+    paragraph, else the document's metadata title, else the filename; body is
+    the paragraph prose (tables skipped — row data, not prose). Corrupt or
+    password-protected files raise; ingest's per-file isolation handles it."""
+    import docx
+
+    document = docx.Document(str(path))
+
+    title = ""
+    body_parts: list[str] = []
+    length = 0
+    for para in document.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        style = (para.style.name or "") if para.style is not None else ""
+        if not title and (style.startswith("Heading") or style.startswith("Title")):
+            title = text
+        if length < DOC_BODY_CAP:
+            body_parts.append(text)
+            length += len(text) + 1
+
+    if not title:
+        try:
+            title = (document.core_properties.title or "").strip()
+        except Exception:  # noqa: BLE001 - malformed metadata is common
+            title = ""
+    return title or path.stem, "\n".join(body_parts)[:DOC_BODY_CAP]
+
+
+def parse_csv(path: Path) -> tuple[str, str]:
+    """(title, body) for a .csv: the filename and its COLUMN NAMES — never row
+    data. A file whose first row looks like data (no header) gets an empty
+    body, which ingest stores as a thin item."""
+    import csv
+
+    with path.open(newline="", errors="replace") as fh:
+        sample = fh.read(CSV_SNIFF_BYTES)
+        fh.seek(0)
+        try:
+            # Restrict candidates: unrestricted, the sniffer will happily pick
+            # a letter as the delimiter for a single-column file.
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel  # single-column files commonly fail sniffing
+        try:
+            has_header = csv.Sniffer().has_header(sample)
+        except csv.Error:
+            # Undecidable: keeping a real header beats skipping one odd row.
+            has_header = True
+        if not has_header:
+            return path.stem, ""
+        first_row = next(csv.reader(fh, dialect), [])
+
+    columns = ", ".join(cell.strip()[:200] for cell in first_row if cell.strip())
+    return path.stem, columns[:CSV_BODY_CAP]
+
+
+def parse_xlsx(path: Path) -> tuple[str, str]:
+    """(title, body) for a .xlsx: workbook title (else filename), plus one
+    line per sheet with the sheet name and its header row — never data rows.
+    Sheet names alone still count (an empty "Budget 2026" tab is signal)."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        try:
+            title = (wb.properties.title or "").strip()
+        except Exception:  # noqa: BLE001 - malformed metadata is common
+            title = ""
+        lines: list[str] = []
+        for ws in wb.worksheets[:XLSX_SHEET_CAP]:
+            header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            columns = ", ".join(
+                str(cell).strip()[:200] for cell in header if cell is not None and str(cell).strip()
+            )
+            lines.append(f"{ws.title}: {columns}" if columns else ws.title)
+    finally:
+        wb.close()  # read_only mode holds the file handle open
+    return title or path.stem, "\n".join(lines)[:DOC_BODY_CAP]
 
 
 def _ocr_pdf_pages(path: Path, page_indexes: list[int], ocr_processor) -> list[str]:

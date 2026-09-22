@@ -1,10 +1,17 @@
-"""Persistent Moondream2 captioning worker, run under `sem_search_caption`.
+"""Persistent captioning worker, run under a separate conda env.
 
 Same rationale and protocol as scripts/ocr_worker.py — this process is
-deliberately dependency-free w.r.t. the image_search package, because
-moondream2's trust_remote_code model class doesn't load under the
-`transformers` version `sem_search_gpu` needs for native SigLIP2/
-sentence-transformers support. See docs/gpu-setup.md.
+deliberately dependency-free w.r.t. the image_search package. The model is
+chosen by argv[1] (the config's caption model id, passed by
+processors/subprocess_bridge.py):
+
+  moondream2  vikhyatk/moondream2 (trust_remote_code) — the GPU default; its
+              model class doesn't load under the `transformers` version
+              `sem_search_gpu` needs for native SigLIP2/sentence-transformers
+              support, hence the separate env. See docs/gpu-setup.md.
+  blip-base   Salesforce/blip-image-captioning-base — plain transformers, no
+              remote code, ~1GB: runs on CPU-only machines (set
+              IMAGE_SEARCH_CAPTION_ENV to any env with torch+transformers).
 
   parent -> worker: one absolute image path per line
   worker -> parent: one JSON object per line: {"text": "..."} or {"error": "..."}
@@ -17,6 +24,47 @@ from __future__ import annotations
 import json
 import sys
 
+BLIP_REPO = "Salesforce/blip-image-captioning-base"
+BLIP_MAX_NEW_TOKENS = 40
+
+
+def _load_moondream(device: str):
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        "vikhyatk/moondream2",
+        revision="2025-06-21",
+        trust_remote_code=True,
+        attn_implementation="eager",
+    ).to(device).eval()
+
+    def caption(img) -> str:
+        return model.caption(img, length="normal")["caption"]
+
+    return caption
+
+
+def _load_blip(device: str):
+    import torch
+    from transformers import BlipForConditionalGeneration, BlipProcessor
+
+    processor = BlipProcessor.from_pretrained(BLIP_REPO)
+    model = BlipForConditionalGeneration.from_pretrained(BLIP_REPO).to(device).eval()
+
+    def caption(img) -> str:
+        inputs = processor(images=img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=BLIP_MAX_NEW_TOKENS)
+        return processor.decode(out[0], skip_special_tokens=True).strip()
+
+    return caption
+
+
+LOADERS = {
+    "moondream2": _load_moondream,
+    "blip-base": _load_blip,
+}
+
 
 def main() -> None:
     import torch
@@ -24,15 +72,20 @@ def main() -> None:
     # Same Pascal cuDNN9 conv2d issue as image_embed.py (docs/gpu-setup.md).
     torch.backends.cudnn.enabled = False
 
-    from transformers import AutoModelForCausalLM
     from PIL import Image
 
-    model = AutoModelForCausalLM.from_pretrained(
-        "vikhyatk/moondream2",
-        revision="2025-06-21",
-        trust_remote_code=True,
-        attn_implementation="eager",
-    ).to("cuda").eval()
+    model_id = sys.argv[1] if len(sys.argv) > 1 else "moondream2"
+    loader = LOADERS.get(model_id)
+    if loader is None:
+        print(
+            json.dumps({"error": f"unknown caption model {model_id!r} "
+                        f"(known: {sorted(LOADERS)})"}),
+            flush=True,
+        )
+        sys.exit(1)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    caption = loader(device)
     print("READY", flush=True)
 
     for line in sys.stdin:
@@ -41,8 +94,7 @@ def main() -> None:
             continue
         try:
             img = Image.open(path).convert("RGB")
-            result = model.caption(img, length="normal")
-            print(json.dumps({"text": result["caption"]}), flush=True)
+            print(json.dumps({"text": caption(img)}), flush=True)
         except Exception as exc:  # noqa: BLE001 - report to parent, keep serving
             print(json.dumps({"error": str(exc)}), flush=True)
 

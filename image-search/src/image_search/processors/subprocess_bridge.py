@@ -39,9 +39,12 @@ class SubprocessBridgeProcessor:
         if not self.worker_script.exists():
             raise RuntimeError(f"Worker script not found at {self.worker_script}")
 
+        # The model id rides along as argv so one worker script can serve
+        # several models (e.g. moondream2 on GPU boxes, blip-base on CPU).
+        # Workers that only know one model ignore it.
         self._proc = subprocess.Popen(
             ["conda", "run", "-n", self.env_name(), "--no-capture-output",
-             "python", str(self.worker_script)],
+             "python", str(self.worker_script), self.model_id],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,

@@ -55,3 +55,71 @@ def test_migrate_fresh_db_has_source_column(tmp_path):
     migrate(conn)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(text_fts)")}
     assert "source" in cols
+
+
+# --- portable-format versioning and journal modes ----------------------------
+
+from pathlib import Path
+
+import pytest
+
+from image_search.store.db import DB_VERSION, _default_journal_mode
+
+
+def test_user_version_stamped_on_new_db(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == DB_VERSION
+
+
+def test_legacy_db_with_data_is_refused(tmp_path):
+    """A pre-portable DB (files keyed by absolute path, user_version 0) that
+    holds rows must fail loudly, not be silently misread."""
+    conn = connect(tmp_path / "t.db")
+    conn.executescript(
+        "CREATE TABLE files (path TEXT PRIMARY KEY, folder TEXT NOT NULL, "
+        "image_id TEXT NOT NULL, mtime REAL NOT NULL);"
+    )
+    conn.execute("INSERT INTO files VALUES ('/abs/a.png', '~/Pics', 'id1', 1.0)")
+    conn.commit()
+    with pytest.raises(RuntimeError, match="re-index"):
+        migrate(conn)
+
+
+def test_legacy_empty_files_table_is_rebuilt(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    conn.executescript(
+        "CREATE TABLE files (path TEXT PRIMARY KEY, folder TEXT NOT NULL, "
+        "image_id TEXT NOT NULL, mtime REAL NOT NULL);"
+    )
+    conn.commit()
+    migrate(conn)
+    pks = {r["name"]: r["pk"] for r in conn.execute("PRAGMA table_info(files)")}
+    assert pks["folder"] == 1 and pks["path"] == 2
+
+
+def test_journal_mode_arg_and_env(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "a.db", journal_mode="truncate")
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "truncate"
+
+    monkeypatch.setenv("IMAGE_SEARCH_JOURNAL_MODE", "delete")
+    conn2 = connect(tmp_path / "b.db")
+    assert conn2.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_invalid_journal_mode_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        connect(tmp_path / "a.db", journal_mode="wal; DROP TABLE files")
+
+
+def test_default_journal_mode_by_filesystem(tmp_path):
+    mounts = tmp_path / "mounts"
+    mounts.write_text(
+        "/dev/sda1 / ext4 rw 0 0\n"
+        "C:\\134 /mnt/c 9p rw 0 0\n"
+        "D:\\134 /mnt/d 9p rw 0 0\n"
+    )
+    assert _default_journal_mode(Path("/home/x/index.db"), str(mounts)) == "wal"
+    assert _default_journal_mode(Path("/mnt/d/.semantic_search/index.db"), str(mounts)) == "truncate"
+    # Missing mounts file (non-Linux): WAL.
+    assert _default_journal_mode(Path("/anywhere/index.db"), str(tmp_path / "nope")) == "wal"

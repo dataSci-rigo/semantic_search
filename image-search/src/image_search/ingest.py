@@ -22,17 +22,24 @@ logger = logging.getLogger(__name__)
 
 
 def ingest_folder(
-    conn: sqlite3.Connection, config: SearchConfig, registry: Registry, folder_key: str
+    conn: sqlite3.Connection,
+    config: SearchConfig,
+    registry: Registry,
+    folder_key: str,
+    allow_empty_prune: bool = False,
 ) -> dict[str, int]:
     """Incrementally index one configured folder: images through the
     processor pipeline, .md/.txt files as note items, .links files as link
-    items — all searchable together.
+    items, .pdf/.docx/.csv/.xlsx files as document items — all searchable
+    together.
 
     Freshness is tracked per *path* (files table: stat-only skip for unchanged
     mtimes, no re-hashing), while processing happens once per *content id* —
     renames, metadata-only touches, and byte-identical duplicate copies never
     reprocess or duplicate derived records. Content no path references anymore
-    is purged at the end.
+    is purged at the end. Paths are stored relative to the folder root
+    (folder.to_db_path), so the index survives the root moving or mounting
+    elsewhere.
 
     One bad file costs one file: a failing processor (corrupt image, transient
     OCR/caption worker hiccup) is logged and counted, and the walk continues.
@@ -42,7 +49,18 @@ def ingest_folder(
 
     Returns counts, including "failed"."""
     folder = config.folders[folder_key]
-    walked = images_store.walk_candidates(folder.path)
+    if not folder.path.is_dir():
+        # Never mistake an unmounted/missing root for an emptied one — walking
+        # it would yield zero paths and prune the folder's entire index.
+        logger.error(
+            "%s: root %s does not exist (unmounted drive?) — skipping folder",
+            folder_key, folder.path,
+        )
+        return {
+            "seen": 0, "skipped": 0, "indexed": 0, "pruned": 0, "failed": 0,
+            "error": f"root missing: {folder.path}",
+        }
+    walked = images_store.walk_candidates(folder.path, folder.effective_exclude_dirs())
     known = images_store.load_file_state(conn, folder_key)
 
     # Phase the walk: caption-pipeline images first, everything else (OCR
@@ -66,11 +84,11 @@ def ingest_folder(
             registry.close_kind("caption")
             caption_phase_open = False
             logger.info("%s: caption phase done, released caption worker", folder_key)
-        path_str = str(path)
+        db_path = folder.to_db_path(path)
         # Added before dispatch so a file that fails is never mistaken for a
         # deleted one and purged by prune_missing below.
-        seen_paths.add(path_str)
-        prior = known.get(path_str)
+        seen_paths.add(db_path)
+        prior = known.get(db_path)
         if prior is not None and prior[1] == mtime:
             stats["skipped"] += 1
             continue
@@ -78,24 +96,34 @@ def ingest_folder(
         try:
             suffix = path.suffix.lower()
             if suffix in textitems.NOTE_EXTENSIONS:
-                indexed = _ingest_note(conn, registry, folder, folder_key, path, mtime)
+                indexed = _ingest_note(conn, registry, folder, folder_key, path, mtime, db_path)
             elif suffix == textitems.LINKS_EXTENSION:
-                indexed = _ingest_links(conn, registry, folder, folder_key, path, mtime)
-            elif suffix == textitems.PDF_EXTENSION:
-                indexed = _ingest_pdf(conn, registry, folder, folder_key, path, mtime)
+                indexed = _ingest_links(conn, registry, folder, folder_key, path, mtime, db_path)
+            elif suffix in textitems.DOCUMENT_KINDS:
+                indexed = _ingest_document(conn, registry, folder, folder_key, path, mtime, db_path)
             else:
-                indexed = _ingest_image(conn, registry, folder, folder_key, path, mtime)
+                indexed = _ingest_image(conn, registry, folder, folder_key, path, mtime, db_path)
             stats["indexed" if indexed else "skipped"] += 1
         except Exception:  # noqa: BLE001 - one bad file must not end the run
             # Discard this file's partial writes: the _ingest_* helpers commit
             # only on success, so without this rollback its half-written rows
             # would ride along on the next file's commit.
             conn.rollback()
-            logger.exception("ingest failed for %s (skipped; retried next run)", path_str)
+            logger.exception("ingest failed for %s (skipped; retried next run)", path)
             stats["failed"] += 1
-            failed_paths.append(path_str)
+            failed_paths.append(str(path))
 
-    stats["pruned"] = images_store.prune_missing(conn, folder_key, seen_paths)
+    if known and not seen_paths and not allow_empty_prune:
+        # A walk that finds nothing where files were known is far more likely
+        # a mount that vanished mid-run than a genuine mass deletion. Keep the
+        # index; `index --prune-empty` forces the prune when it IS deliberate.
+        logger.warning(
+            "%s: walk found no files but %d were known — skipping prune "
+            "(pass --prune-empty if everything really was deleted)",
+            folder_key, len(known),
+        )
+    else:
+        stats["pruned"] = images_store.prune_missing(conn, folder_key, seen_paths)
     conn.commit()
     if failed_paths:
         logger.warning(
@@ -109,12 +137,13 @@ def ingest_folder(
 
 def _ingest_phase(folder: FolderConfig, path: Path) -> int:
     """0 = caption-pipeline image (GPU-heavy caption worker), 1 = everything
-    else. Non-image files are all phase 1 — notes/links are cheap, and PDFs
-    use the OCR worker, so they belong with the OCR phase."""
+    else. Non-image files are all phase 1 — notes/links/documents are cheap
+    (PDFs may use the OCR worker), so they belong with the OCR phase."""
     suffix = path.suffix.lower()
-    if suffix in textitems.NOTE_EXTENSIONS or suffix in (
-        textitems.LINKS_EXTENSION,
-        textitems.PDF_EXTENSION,
+    if (
+        suffix in textitems.NOTE_EXTENSIONS
+        or suffix == textitems.LINKS_EXTENSION
+        or suffix in textitems.DOCUMENT_KINDS
     ):
         return 1
     return 0 if "caption" in folder.processors_for_path(path) else 1
@@ -133,9 +162,10 @@ def _ingest_note(
     folder_key: str,
     path: Path,
     mtime: float,
+    db_path: str,
 ) -> bool:
     item_id = textitems.note_id(path)
-    images_store.upsert_file(conn, str(path), folder_key, item_id, mtime)
+    images_store.upsert_file(conn, db_path, folder_key, item_id, mtime)
     if conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
         conn.commit()
         return False
@@ -145,7 +175,7 @@ def _ingest_note(
         item_id=item_id,
         kind="note",
         folder=folder_key,
-        src_path=str(path),
+        src_path=db_path,
         title=title,
         url=None,
         body=body,
@@ -162,10 +192,11 @@ def _ingest_links(
     folder_key: str,
     path: Path,
     mtime: float,
+    db_path: str,
 ) -> bool:
     """Diff a .links file against its previously ingested items: fetch and
     add only new URLs, drop items for URLs that left the file."""
-    path_str = str(path)
+    path_str = db_path
     images_store.upsert_file(
         conn, path_str, folder_key, images_store.content_hash(path), mtime
     )
@@ -215,56 +246,69 @@ def _ingest_links(
     return added > 0 or bool(previous_ids - current_ids)
 
 
-def _ingest_pdf(
+def _ingest_document(
     conn: sqlite3.Connection,
     registry: Registry,
     folder: FolderConfig,
     folder_key: str,
     path: Path,
     mtime: float,
+    db_path: str,
 ) -> bool:
-    """Index a sample of a PDF's pages. Financial/tax documents are skipped by
-    filename — see textitems.FINANCIAL_PATTERNS and the exclude_patterns
-    folder option."""
-    if folder.excludes_pdf(path):
+    """Index a document file (.pdf: sampled pages; .docx: heading + prose;
+    .csv/.xlsx: title and COLUMN NAMES only, never row data). Financial/tax
+    documents are skipped by filename — see textitems.FINANCIAL_PATTERNS and
+    the exclude_patterns folder option."""
+    kind = textitems.DOCUMENT_KINDS[path.suffix.lower()]
+    if folder.excludes_document(path):
         images_store.upsert_file(
-            conn, str(path), folder_key, textitems.note_id(path), mtime
+            conn, db_path, folder_key, images_store.content_hash(path), mtime
         )
         conn.commit()
-        logger.info("pdf %s: excluded by pattern", path.name)
+        logger.info("%s %s: excluded by pattern", kind, path.name)
         return False
 
-    item_id = textitems.note_id(path)  # content hash: same file, same item
-    images_store.upsert_file(conn, str(path), folder_key, item_id, mtime)
+    # Content hash (streamed): same file bytes, same item — renames and
+    # duplicate copies share one processed row, like images do.
+    item_id = images_store.content_hash(path)
+    images_store.upsert_file(conn, db_path, folder_key, item_id, mtime)
     if conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
         conn.commit()
         return False
 
-    # Scanned pages have no text layer; reuse the folder's OCR processor when
-    # one is configured rather than requiring a second OCR setup.
-    ocr_model = folder.processors_for_path(path).get("ocr")
-    ocr_processor = registry.get("ocr", ocr_model) if ocr_model else None
-
-    title, body = textitems.parse_pdf(path, ocr_processor=ocr_processor)
+    if kind == "pdf":
+        # Scanned pages have no text layer; reuse the folder's OCR processor
+        # when one is configured rather than requiring a second OCR setup.
+        ocr_model = folder.processors_for_path(path).get("ocr")
+        ocr_processor = registry.get("ocr", ocr_model) if ocr_model else None
+        title, body = textitems.parse_pdf(path, ocr_processor=ocr_processor)
+    elif kind == "docx":
+        title, body = textitems.parse_docx(path)
+    elif kind == "csv":
+        title, body = textitems.parse_csv(path)
+    else:
+        title, body = textitems.parse_xlsx(path)
 
     # Second gate, on the text itself: filenames don't announce what a
     # document contains. Only applies where the folder is using the built-in
     # financial patterns — an explicit exclude_patterns list means the user
-    # has stated exactly what to skip.
+    # has stated exactly what to skip. For csv/xlsx the "text" is column
+    # names, and headers like "routing number" tripping the gate is exactly
+    # what a privacy filter should do.
     if folder.exclude_patterns is None:
         marker = textitems.content_looks_financial(title, body)
         if marker is not None:
             conn.commit()
-            logger.info("pdf %s: excluded, content matched %r", path.name, marker)
+            logger.info("%s %s: excluded, content matched %r", kind, path.name, marker)
             return False
 
     status = textitems.STATUS_OK if body.strip() else textitems.STATUS_THIN
     textitems.insert_item(
         conn,
         item_id=item_id,
-        kind="pdf",
+        kind=kind,
         folder=folder_key,
-        src_path=str(path),
+        src_path=db_path,
         title=title,
         url=None,
         body=body,
@@ -282,9 +326,10 @@ def _ingest_image(
     folder_key: str,
     path: Path,
     mtime: float,
+    db_path: str,
 ) -> bool:
     disc = images_store.describe(path, folder_key, mtime)
-    images_store.upsert_file(conn, str(path), folder_key, disc.image_id, mtime)
+    images_store.upsert_file(conn, db_path, folder_key, disc.image_id, mtime)
     if images_store.is_indexed(conn, disc.image_id):
         # Same content already processed under another path (duplicate
         # copy), a rename, or a metadata-only touch — nothing to redo.
@@ -373,19 +418,26 @@ def _ingest_image(
     # done-marker is_indexed checks, and the per-image commit below makes
     # each image all-or-nothing (a crash mid-image rolls back its files
     # row too, so the next run retries it).
-    images_store.upsert_image(conn, disc)
+    images_store.upsert_image(conn, disc, db_path)
     conn.commit()
     return True
 
 
-def ingest_all(conn: sqlite3.Connection, config: SearchConfig, registry: Registry) -> dict:
+def ingest_all(
+    conn: sqlite3.Connection,
+    config: SearchConfig,
+    registry: Registry,
+    allow_empty_prune: bool = False,
+) -> dict:
     """Index every configured folder. A folder that fails outright (unreadable
     path, unmounted drive — walk_candidates throws before per-file handling
     can help) is reported and skipped so the remaining folders still index."""
     out: dict[str, dict] = {}
     for folder_key in config.folders:
         try:
-            out[folder_key] = ingest_folder(conn, config, registry, folder_key)
+            out[folder_key] = ingest_folder(
+                conn, config, registry, folder_key, allow_empty_prune=allow_empty_prune
+            )
         except Exception as exc:  # noqa: BLE001 - one bad folder must not end the run
             conn.rollback()
             logger.exception("ingest failed for folder %s (skipped)", folder_key)

@@ -35,9 +35,6 @@ from image_search.search import (  # noqa: E402
 from image_search.store.db import connect, migrate  # noqa: E402
 
 CONFIG_PATH = os.environ.get("IMAGE_SEARCH_CONFIG", str(PROJECT_ROOT / "config" / "folders.yaml"))
-DB_PATH = os.environ.get(
-    "IMAGE_SEARCH_DB", str(PROJECT_ROOT / "data" / "pictures_index.db")
-)
 PORT = int(os.environ.get("IMAGE_SEARCH_WEB_PORT", 9100))
 THUMB_SIZE = (480, 480)
 # Guest mode: hide private-path and nsfw-tagged images from every route.
@@ -48,6 +45,13 @@ app = Flask(__name__)
 
 _config = load_config(CONFIG_PATH)
 _registry = Registry(_config)
+
+# Same precedence as the CLI: env > the config's `db:` > project default.
+DB_PATH = os.environ.get("IMAGE_SEARCH_DB") or (
+    str(_config.db_path)
+    if _config.db_path is not None
+    else str(PROJECT_ROOT / "data" / "pictures_index.db")
+)
 
 # So the web app can start (and show "no results yet") even before the
 # indexer has run for the first time, instead of erroring on missing tables.
@@ -242,22 +246,31 @@ def api_save():
     ), 400
 
 
+def _image_path(image_id: str) -> Path:
+    """Resolve a stored (folder, relative-path) image row to a local absolute
+    path, 404ing when the id is unknown, its folder isn't in this config, or
+    the file is gone (e.g. the drive isn't mounted right now)."""
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT path, folder FROM images WHERE id = ?", (image_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        abort(404)
+    path = _config.resolve_stored(row["folder"], row["path"])
+    if path is None or not path.exists():
+        abort(404)
+    return path
+
+
 @app.route("/image/<image_id>")
 def image_thumb(image_id: str):
     from PIL import Image
 
     _guard_private(image_id)
-    conn = _db()
-    try:
-        row = conn.execute("SELECT path FROM images WHERE id = ?", (image_id,)).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        abort(404)
-
-    path = Path(row["path"])
-    if not path.exists():
-        abort(404)
+    path = _image_path(image_id)
 
     img = Image.open(path).convert("RGB")
     img.thumbnail(THUMB_SIZE)
@@ -269,16 +282,7 @@ def image_thumb(image_id: str):
 @app.route("/full/<image_id>")
 def image_full(image_id: str):
     _guard_private(image_id)
-    conn = _db()
-    try:
-        row = conn.execute("SELECT path FROM images WHERE id = ?", (image_id,)).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        abort(404)
-    path = Path(row["path"])
-    if not path.exists():
-        abort(404)
+    path = _image_path(image_id)
     from flask import send_file
 
     return send_file(path)

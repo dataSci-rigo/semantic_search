@@ -2,19 +2,43 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import warnings
 from pathlib import Path
 
-from image_search.config import load_config
+from image_search.config import SearchConfig, load_config
 from image_search.ingest import ingest_all
 from image_search.registry import Registry
 from image_search.search import search_similar_images, search_text
 from image_search.store import images as images_store
 from image_search.store.db import connect, migrate
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "folders.yaml"
-DEFAULT_DB = Path(__file__).resolve().parents[2] / "index.db"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG = os.environ.get(
+    "IMAGE_SEARCH_CONFIG", str(PROJECT_ROOT / "config" / "folders.yaml")
+)
+# Matches the webapp's default so CLI and server can't silently diverge.
+FALLBACK_DB = PROJECT_ROOT / "data" / "pictures_index.db"
+
+
+def resolve_db_path(cli_db: str | None, config: SearchConfig) -> str:
+    """DB path precedence: --db flag > IMAGE_SEARCH_DB env > the config's
+    top-level `db:` > <project>/data/pictures_index.db."""
+    if cli_db:
+        return cli_db
+    env_db = os.environ.get("IMAGE_SEARCH_DB")
+    if env_db:
+        if config.db_path is not None and str(config.db_path) != env_db:
+            print(
+                f"warning: IMAGE_SEARCH_DB={env_db} overrides this config's "
+                f"db: {config.db_path}",
+                file=sys.stderr,
+            )
+        return env_db
+    if config.db_path is not None:
+        return str(config.db_path)
+    return str(FALLBACK_DB)
 
 
 def cmd_index(args: argparse.Namespace) -> None:
@@ -27,12 +51,12 @@ def cmd_index(args: argparse.Namespace) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     config = load_config(args.config)
-    conn = connect(args.db)
+    conn = connect(resolve_db_path(args.db, config))
     migrate(conn)
     registry = Registry(config)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        stats = ingest_all(conn, config, registry)
+        stats = ingest_all(conn, config, registry, allow_empty_prune=args.prune_empty)
         for w in caught:
             print(f"warning: {w.message}", file=sys.stderr)
     for folder_key, folder_stats in stats.items():
@@ -52,7 +76,7 @@ def cmd_index(args: argparse.Namespace) -> None:
 
 def cmd_search(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    conn = connect(args.db)
+    conn = connect(resolve_db_path(args.db, config))
     migrate(conn)
     registry = Registry(config)
     hits = search_text(conn, config, registry, args.folder, args.query, k=args.k)
@@ -62,7 +86,7 @@ def cmd_search(args: argparse.Namespace) -> None:
 
 def cmd_similar(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    conn = connect(args.db)
+    conn = connect(resolve_db_path(args.db, config))
     migrate(conn)
     image_id = images_store.content_hash(Path(args.image))
     hits = search_similar_images(conn, config, args.folder, image_id, k=args.k)
@@ -71,29 +95,57 @@ def cmd_similar(args: argparse.Namespace) -> None:
 
 
 def cmd_dupes(args: argparse.Namespace) -> None:
-    conn = connect(args.db)
+    config = load_config(args.config)
+    conn = connect(resolve_db_path(args.db, config))
     migrate(conn)
     groups = images_store.duplicate_groups(conn)
     if not groups:
         print("No duplicate files in the index.")
         return
-    total = sum(len(paths) - 1 for _, paths in groups)
-    for image_id, paths in groups:
-        print(f"{image_id[:12]}  keep  {paths[0]}")
-        for extra in paths[1:]:
+
+    # Resolve each stored (folder, relative-path) pair against this config;
+    # copies in folders the config doesn't know are ignored (never deleted).
+    skipped_folders: set[str] = set()
+    display: list[tuple[str, list[tuple[str, str, Path]]]] = []
+    for image_id, entries in groups:
+        resolved_entries: list[tuple[str, str, Path]] = []
+        for folder_key, rel in entries:
+            resolved = config.resolve_stored(folder_key, rel)
+            if resolved is None:
+                skipped_folders.add(folder_key)
+            else:
+                resolved_entries.append((folder_key, rel, resolved))
+        if len(resolved_entries) > 1:
+            display.append((image_id, resolved_entries))
+    if skipped_folders:
+        print(
+            f"warning: folder(s) {sorted(skipped_folders)} are not in this config; "
+            "their copies were ignored",
+            file=sys.stderr,
+        )
+    if not display:
+        print("No duplicate files in the folders this config covers.")
+        return
+
+    total = sum(len(entries) - 1 for _, entries in display)
+    for image_id, entries in display:
+        print(f"{image_id[:12]}  keep  {entries[0][2]}")
+        for _, _, extra in entries[1:]:
             print(f"{'':12}  dup   {extra}")
     if not args.delete:
         print(
-            f"\n{total} duplicate file(s) in {len(groups)} group(s). "
+            f"\n{total} duplicate file(s) in {len(display)} group(s). "
             "Re-run with --delete to remove them from disk "
             "(keeps the first path in each group)."
         )
         return
     deleted = 0
-    for _, paths in groups:
-        for extra in paths[1:]:
-            Path(extra).unlink(missing_ok=True)
-            conn.execute("DELETE FROM files WHERE path = ?", (extra,))
+    for image_id, entries in display:
+        for folder_key, rel, extra in entries[1:]:
+            extra.unlink(missing_ok=True)
+            conn.execute(
+                "DELETE FROM files WHERE folder = ? AND path = ?", (folder_key, rel)
+            )
             deleted += 1
     conn.commit()
     print(f"\nDeleted {deleted} duplicate file(s); kept one copy per group.")
@@ -112,7 +164,7 @@ def cmd_tag_backfill(args: argparse.Namespace) -> None:
     from image_search.store.vectors import vec_table_name
 
     config = load_config(args.config)
-    conn = connect(args.db)
+    conn = connect(resolve_db_path(args.db, config))
     migrate(conn)
     load_vec_extension(conn)
 
@@ -201,11 +253,22 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="image-search")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to folders.yaml")
-    parser.add_argument("--db", default=str(DEFAULT_DB), help="Path to the SQLite index file")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="Path to folders.yaml")
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="Path to the SQLite index file (default: $IMAGE_SEARCH_DB, else the "
+        "config's `db:` key, else <project>/data/pictures_index.db)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_index = sub.add_parser("index", help="Discover files and run enabled processors")
+    p_index.add_argument(
+        "--prune-empty",
+        action="store_true",
+        help="Allow pruning a folder's whole index when the walk finds nothing "
+        "(normally skipped — an empty walk usually means an unplugged drive)",
+    )
     p_index.set_defaults(func=cmd_index)
 
     p_search = sub.add_parser("search", help="Hybrid semantic + keyword text search")

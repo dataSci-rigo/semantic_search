@@ -7,11 +7,12 @@ from image_search.processors.subprocess_bridge import SubprocessBridgeProcessor
 
 
 class MoondreamCaptionProcessor(SubprocessBridgeProcessor):
-    """Captioning via Moondream2, run in a separate conda env
-    (`sem_search_caption`) as a persistent subprocess. Moondream2's
-    trust_remote_code model class doesn't load under the `transformers`
-    version `sem_search_gpu` needs for native SigLIP2/sentence-transformers
-    support — so captioning runs out-of-process. See docs/gpu-setup.md."""
+    """Captioning via a persistent worker subprocess in a separate conda env
+    (`sem_search_caption`; override with IMAGE_SEARCH_CAPTION_ENV). The model
+    id is passed to the worker, which knows "moondream2" (GPU default; its
+    trust_remote_code class doesn't load under the `transformers` version
+    `sem_search_gpu` needs — see docs/gpu-setup.md) and "blip-base"
+    (Salesforce BLIP, plain transformers, runs on CPU-only machines)."""
 
     kind = "caption"
     worker_script = Path(__file__).resolve().parents[3] / "scripts" / "caption_worker.py"

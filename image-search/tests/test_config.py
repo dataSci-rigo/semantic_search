@@ -241,3 +241,71 @@ def test_private_rejects_non_list(tmp_path):
     )
     with pytest.raises(ValueError):
         load_config(path)
+
+
+# --- named folders, config-relative paths, exclude_dirs ----------------------
+
+
+def test_named_folder_with_explicit_path(tmp_path):
+    root = tmp_path / "library"
+    root.mkdir()
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(f"folders:\n  photos:\n    path: {root}\n    ocr: x\n")
+    config = load_config(config_path)
+    assert set(config.folders) == {"photos"}
+    assert config.folders["photos"].path == root
+
+
+def test_drive_resident_config_resolves_relative_path_and_db(tmp_path):
+    meta = tmp_path / ".semantic_search"
+    meta.mkdir()
+    config_path = meta / "folders.yaml"
+    config_path.write_text("db: index.db\nfolders:\n  drive:\n    path: ..\n    ocr: x\n")
+    config = load_config(config_path)
+    assert config.folders["drive"].path == tmp_path.resolve()
+    assert config.db_path == meta.resolve() / "index.db"
+
+
+def test_legacy_key_is_path_still_works(tmp_path):
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text('folders:\n  "~/Pictures":\n    ocr: x\n')
+    config = load_config(config_path)
+    folder = config.folders["~/Pictures"]
+    assert folder.path == Path("~/Pictures").expanduser()
+
+
+def test_to_from_db_path_roundtrip(tmp_path):
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(f"folders:\n  d:\n    path: {tmp_path}\n    ocr: x\n")
+    folder = load_config(config_path).folders["d"]
+    original = tmp_path / "nested dir" / "uni-códe.png"
+    stored = folder.to_db_path(original)
+    assert stored == "nested dir/uni-códe.png"  # POSIX separators, relative
+    assert folder.from_db_path(stored) == original
+
+
+def test_exclude_dirs_default_and_override(tmp_path):
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        f"folders:\n"
+        f"  a:\n    path: {tmp_path}\n    ocr: x\n"
+        f"  b:\n    path: {tmp_path}\n    ocr: x\n    exclude_dirs: [backup]\n"
+        f"  c:\n    path: {tmp_path}\n    ocr: x\n    exclude_dirs: []\n"
+    )
+    config = load_config(config_path)
+    from image_search.config import DEFAULT_EXCLUDE_DIRS
+
+    assert config.folders["a"].effective_exclude_dirs() == DEFAULT_EXCLUDE_DIRS
+    assert config.folders["b"].effective_exclude_dirs() == ("backup",)
+    assert config.folders["c"].effective_exclude_dirs() == ()
+
+
+def test_relative_private_patterns_anchor_to_config_dir(tmp_path):
+    meta = tmp_path / ".semantic_search"
+    meta.mkdir()
+    config_path = meta / "folders.yaml"
+    config_path.write_text(
+        "folders:\n  d:\n    path: ..\n    ocr: x\nprivate:\n  - pictures/private\n"
+    )
+    config = load_config(config_path)
+    assert config.private_patterns == (str(meta.resolve() / "pictures" / "private"),)

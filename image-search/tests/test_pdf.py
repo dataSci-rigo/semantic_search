@@ -70,12 +70,12 @@ def test_exclude_patterns_can_be_overridden_per_folder(tmp_path):
     config = load_config(config_path)
 
     papers = config.folders["~/Papers"]
-    assert papers.excludes_pdf(Path("draft-notes.pdf")) is True
+    assert papers.excludes_document(Path("draft-notes.pdf")) is True
     # An explicit list replaces the financial defaults.
-    assert papers.excludes_pdf(Path("1099.pdf")) is False
+    assert papers.excludes_document(Path("1099.pdf")) is False
 
     docs = config.folders["~/Docs"]
-    assert docs.excludes_pdf(Path("1099.pdf")) is True
+    assert docs.excludes_document(Path("1099.pdf")) is True
 
 
 def test_empty_exclude_patterns_indexes_everything(tmp_path):
@@ -84,7 +84,7 @@ def test_empty_exclude_patterns_indexes_everything(tmp_path):
         'folders:\n  "~/All":\n    text_embed: x\n    exclude_patterns: []\n'
     )
     folder = load_config(config_path).folders["~/All"]
-    assert folder.excludes_pdf(Path("1099.pdf")) is False
+    assert folder.excludes_document(Path("1099.pdf")) is False
 
 
 def test_invalid_exclude_regex_raises(tmp_path):

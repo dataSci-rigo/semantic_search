@@ -398,3 +398,58 @@ def test_exclude_ids_hides_hits(tmp_path):
         conn, config, registry, folder, "sunset", exclude_ids={"img-hide"}
     )
     assert [h.image_id for h in hits] == ["img-keep"]
+
+
+# --- clip source: the image model's text tower finds caption-less images -----
+
+
+class FakeClipEmbed:
+    kind = "image_embed"
+    model_id = "fake-clip"
+
+    def load(self):
+        pass
+
+    def embed_text(self, texts):
+        return [[1.0, 0.0, 0.0] for _ in texts]
+
+
+def test_clip_source_finds_images_with_no_text(tmp_path):
+    """An image with no OCR/caption/FTS text at all must still be findable by
+    a text query via the image-embed model's text tower (source='clip')."""
+    pytest.importorskip("sqlite_vec", reason="requires sqlite-vec")
+    from image_search.store import vectors as vectors_store
+    from image_search.store.db import load_vec_extension
+
+    folder = str(tmp_path / "shots")
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            folders:
+              "{folder}":
+                image_embed: fake-clip
+            """
+        )
+    )
+    config = load_config(config_path)
+    registry = Registry(config)
+    registry._instances[("image_embed", "fake-clip")] = FakeClipEmbed()
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    load_vec_extension(conn)
+
+    conn.execute(
+        "INSERT INTO images (id, path, folder, content_hash, mtime, width, height, indexed_at) "
+        "VALUES ('img1', 'one.png', ?, 'img1', 0, 4, 4, 0)",
+        (folder,),
+    )
+    vectors_store.insert_vector(conn, "image", "fake-clip", "img1", [1.0, 0.0, 0.0])
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "a red square")
+    assert len(hits) == 1
+    assert hits[0].image_id == "img1"
+    assert hits[0].source == "clip"
+    assert hits[0].path.endswith("shots/one.png")  # resolved to absolute
