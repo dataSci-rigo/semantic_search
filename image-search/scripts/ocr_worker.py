@@ -24,9 +24,11 @@ import sys
 def main() -> None:
     import logging
 
-    # RapidOCR logs engine/model INFO lines to stderr, which the bridge
-    # forwards into the parent's output; keep only warnings.
-    logging.getLogger("RapidOCR").setLevel(logging.WARNING)
+    # RapidOCR logs to stderr, which the bridge forwards into the parent's
+    # output: INFO engine banners, plus a WARNING for every image with no
+    # text ("text detection result is empty") — tens of thousands of lines
+    # over a photo library. Keep only real errors.
+    logging.getLogger("RapidOCR").setLevel(logging.ERROR)
 
     from rapidocr import RapidOCR
 
