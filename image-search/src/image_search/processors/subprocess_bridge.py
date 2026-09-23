@@ -22,10 +22,16 @@ class SubprocessBridgeProcessor:
 
     worker_script: Path
     conda_env: str
+    # A worker that can't start won't start on retry #4 either; failing fast
+    # after this many attempts keeps a misconfigured env (bad
+    # IMAGE_SEARCH_<KIND>_ENV, missing deps) from relaunch-storming through
+    # a hundred-thousand-file run.
+    MAX_START_FAILURES = 3
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self._proc: subprocess.Popen | None = None
+        self._start_failures = 0
 
     def env_name(self) -> str:
         """Conda env to run the worker in. `IMAGE_SEARCH_<KIND>_ENV` overrides
@@ -36,7 +42,16 @@ class SubprocessBridgeProcessor:
 
     def load(self) -> None:
         if self._proc is not None:
-            return
+            if self._proc.poll() is None:
+                return
+            # The worker died since the last call; clean up and relaunch.
+            self.close()
+        if self._start_failures >= self.MAX_START_FAILURES:
+            raise RuntimeError(
+                f"Worker for kind={self.kind!r} failed to start "
+                f"{self._start_failures} times (env={self.env_name()!r}); "
+                "not retrying — check the env name and its dependencies"
+            )
         if not self.worker_script.exists():
             raise RuntimeError(f"Worker script not found at {self.worker_script}")
 
@@ -65,28 +80,42 @@ class SubprocessBridgeProcessor:
         ready_line = self._proc.stdout.readline()
         if ready_line.strip() != "READY":
             self._proc.kill()
+            self._proc = None  # a corpse here would poison every later call
+            self._start_failures += 1
             raise RuntimeError(
                 f"Worker failed to start (env={self.env_name()!r}): "
                 f"expected READY, got {ready_line!r}"
             )
+        self._start_failures = 0
 
     def _call(self, path) -> str:
-        """Send one image path to the worker, return its "text" response."""
+        """Send one image path to the worker, return its "text" response.
+        A worker that died is cleaned up so the NEXT call relaunches it —
+        one crash must cost one file, not the rest of the run."""
         self.load()
         assert self._proc is not None and self._proc.stdin is not None
         assert self._proc.stdout is not None
 
-        self._proc.stdin.write(str(path) + "\n")
-        self._proc.stdin.flush()
-        response_line = self._proc.stdout.readline()
-        if not response_line:
+        try:
+            self._proc.stdin.write(str(path) + "\n")
+            self._proc.stdin.flush()
+            response_line = self._proc.stdout.readline()
+        except OSError as exc:
+            self.close()
             raise RuntimeError(
-                f"Worker process ({self.conda_env}) exited unexpectedly"
+                f"Worker ({self.env_name()}) pipe broke on {path}: {exc} "
+                "(worker will be relaunched on the next call)"
+            ) from exc
+        if not response_line:
+            self.close()
+            raise RuntimeError(
+                f"Worker process ({self.env_name()}) exited unexpectedly "
+                "(worker will be relaunched on the next call)"
             )
 
         response = json.loads(response_line)
         if "error" in response:
-            raise RuntimeError(f"Worker error ({self.conda_env}) on {path}: {response['error']}")
+            raise RuntimeError(f"Worker error ({self.env_name()}) on {path}: {response['error']}")
         return response["text"]
 
     def close(self) -> None:

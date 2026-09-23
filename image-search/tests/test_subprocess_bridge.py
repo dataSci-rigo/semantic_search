@@ -89,6 +89,80 @@ def test_close_tolerates_dead_worker(monkeypatch, tmp_path):
     assert proc._proc is None
 
 
+def _fake_proc_class(captured, ready=True, alive=True):
+    class FakeProc:
+        def __init__(self, argv, **kwargs):
+            captured.setdefault("launches", 0)
+            captured["launches"] += 1
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("READY\n" if ready else "")
+
+        def poll(self):
+            return None if alive else 1
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    return FakeProc
+
+
+def test_dead_worker_relaunches_on_next_call(monkeypatch, tmp_path):
+    """One worker crash costs one file: the next load() detects the corpse
+    and relaunches instead of writing into a broken pipe forever."""
+    captured = {}
+    monkeypatch.setattr(
+        subprocess_bridge.subprocess, "Popen", _fake_proc_class(captured, alive=False)
+    )
+    monkeypatch.setenv("CONDA_EXE", "/opt/conda/bin/conda")
+    worker = tmp_path / "worker.py"
+    worker.write_text("print('READY')\n")
+
+    class Bridged(subprocess_bridge.SubprocessBridgeProcessor):
+        kind = "ocr"
+        worker_script = worker
+        conda_env = "some-env"
+
+    proc = Bridged("m")
+    proc.load()
+    assert captured["launches"] == 1
+    proc.load()  # poll() says dead -> close + relaunch
+    assert captured["launches"] == 2
+
+
+def test_failed_starts_stop_retrying_after_cap(monkeypatch, tmp_path):
+    """A worker that never READYs (bad env) fails fast after a few attempts
+    instead of relaunch-storming through a huge run."""
+    import pytest
+
+    captured = {}
+    monkeypatch.setattr(
+        subprocess_bridge.subprocess, "Popen", _fake_proc_class(captured, ready=False)
+    )
+    monkeypatch.setenv("CONDA_EXE", "/opt/conda/bin/conda")
+    worker = tmp_path / "worker.py"
+    worker.write_text("print('nope')\n")
+
+    class Bridged(subprocess_bridge.SubprocessBridgeProcessor):
+        kind = "caption"
+        worker_script = worker
+        conda_env = "missing-env"
+
+    proc = Bridged("m")
+    for _ in range(subprocess_bridge.SubprocessBridgeProcessor.MAX_START_FAILURES):
+        with pytest.raises(RuntimeError, match="expected READY"):
+            proc.load()
+    assert captured["launches"] == proc.MAX_START_FAILURES
+    with pytest.raises(RuntimeError, match="not retrying"):
+        proc.load()
+    assert captured["launches"] == proc.MAX_START_FAILURES  # no further spawns
+
+
 def test_caption_worker_knows_both_models():
     script = (
         Path(__file__).resolve().parents[1] / "scripts" / "caption_worker.py"
