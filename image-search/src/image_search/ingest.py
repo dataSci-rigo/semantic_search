@@ -64,19 +64,20 @@ def ingest_folder(
     walked = images_store.walk_candidates(folder.path, folder.effective_exclude_dirs())
     known = images_store.load_file_state(conn, folder_key)
 
-    # Phase the walk: caption-pipeline images first, everything else (OCR
-    # images, notes, links, PDFs) after. The path-sorted walk otherwise
-    # interleaves photo dirs with Screenshots dirs, keeping the caption
-    # worker (~5.4GB) and OCR worker (~1GB) resident on the GPU at the same
-    # time — which is what overflowed the 8GB card. The sort is stable, so
-    # path order is preserved within each phase; the caption worker is
-    # released at the boundary below.
+    # Phase the walk (see _ingest_phase); the sort is stable, so path order
+    # holds within each phase. Text-family files go first because they are
+    # cheap — a multi-hour image pass would otherwise keep every document
+    # unsearchable until the very end. Captioned and uncaptioned images stay
+    # apart because a path-sorted walk interleaves photo dirs with
+    # Screenshots dirs, keeping the caption worker (~5.4GB) and OCR worker
+    # (~1GB) resident on the GPU at the same time — which is what overflowed
+    # the 8GB card. Workers are released at the phase boundaries below.
     walked.sort(key=lambda pm: _ingest_phase(folder, pm[0]))
 
     stats = {"seen": len(walked), "skipped": 0, "indexed": 0, "pruned": 0, "failed": 0}
     seen_paths: set[str] = set()
     failed_paths: list[str] = []
-    caption_phase_open = True
+    current_phase: int | None = None
     processed = 0
     last_report = time.monotonic()
 
@@ -91,12 +92,20 @@ def ingest_folder(
                 folder_key, processed, len(walked),
                 stats["indexed"], stats["skipped"], stats["failed"],
             )
-        if caption_phase_open and _ingest_phase(folder, path) == 1:
-            # First non-caption file: every caption job is done for this
-            # folder. Free the worker's GPU memory before OCR starts.
-            registry.close_kind("caption")
-            caption_phase_open = False
-            logger.info("%s: caption phase done, released caption worker", folder_key)
+        phase = _ingest_phase(folder, path)
+        if phase != current_phase:
+            if current_phase == 0:
+                # Scanned PDFs may have started the OCR worker; don't carry
+                # it into the caption phase (it relaunches lazily if routed
+                # images need it).
+                registry.close_kind("ocr")
+                logger.info("%s: document phase done, starting images", folder_key)
+            elif current_phase == 1:
+                # Every caption job for this folder is done: free the
+                # worker's memory before the OCR-only images start.
+                registry.close_kind("caption")
+                logger.info("%s: caption phase done, released caption worker", folder_key)
+            current_phase = phase
         db_path = folder.to_db_path(path)
         # Added before dispatch so a file that fails is never mistaken for a
         # deleted one and purged by prune_missing below.
@@ -149,17 +158,17 @@ def ingest_folder(
 
 
 def _ingest_phase(folder: FolderConfig, path: Path) -> int:
-    """0 = caption-pipeline image (GPU-heavy caption worker), 1 = everything
-    else. Non-image files are all phase 1 — notes/links/documents are cheap
-    (PDFs may use the OCR worker), so they belong with the OCR phase."""
+    """Walk order: 0 = text-family files (notes, .links, documents) — cheap,
+    so searchable first; 1 = caption-pipeline images (the heavy caption
+    worker); 2 = every other image (e.g. OCR-only subtrees)."""
     suffix = path.suffix.lower()
     if (
         suffix in textitems.NOTE_EXTENSIONS
         or suffix == textitems.LINKS_EXTENSION
         or suffix in textitems.DOCUMENT_KINDS
     ):
-        return 1
-    return 0 if "caption" in folder.processors_for_path(path) else 1
+        return 0
+    return 1 if "caption" in folder.processors_for_path(path) else 2
 
 
 def _text_embedder(registry: Registry, folder: FolderConfig, path: Path):

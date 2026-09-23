@@ -8,6 +8,7 @@ so they rank alongside memes in the same hybrid search.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import ipaddress
 import re
@@ -63,6 +64,24 @@ def note_id(path: Path) -> str:
 
 def link_id(url: str) -> str:
     return hashlib.sha256(f"link:{url}".encode()).hexdigest()
+
+
+def decode_text(data: bytes, partial: bool = False) -> str:
+    """Decode a text file's bytes the way it was most likely written: a
+    UTF-16 or UTF-8 byte-order mark wins; otherwise strict UTF-8, falling back
+    to Windows-1252 — what Notepad saved before 2019, so years of notes carry
+    é/ñ as single bytes that a UTF-8 read would turn into U+FFFD.
+
+    `partial` means `data` is a prefix of a longer file, so a character cut
+    at the end is expected rather than evidence of a non-UTF-8 file."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    try:
+        return codecs.getincrementaldecoder("utf-8")().decode(data, final=not partial)
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
 
 
 # Params that identify a campaign or referrer, never the content itself.
@@ -142,7 +161,7 @@ def is_fetchable(url: str) -> tuple[bool, str]:
 def parse_note(path: Path) -> tuple[str, str]:
     """(title, body): title is the first markdown heading, else the first
     non-empty line."""
-    body = path.read_text(errors="replace")
+    body = decode_text(path.read_bytes())
     title = ""
     for line in body.splitlines():
         stripped = line.strip()
@@ -162,7 +181,7 @@ def parse_links(path: Path) -> list[tuple[str, str]]:
     whitespace is a comment; blank lines and #-comment lines are skipped.
     Non-URL lines are ignored rather than fatal (hand-edited files)."""
     out: list[tuple[str, str]] = []
-    for line in path.read_text(errors="replace").splitlines():
+    for line in decode_text(path.read_bytes()).splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -416,24 +435,26 @@ def parse_csv(path: Path) -> tuple[str, str]:
     data. A file whose first row looks like data (no header) gets an empty
     body, which ingest stores as a thin item."""
     import csv
+    import io
 
-    with path.open(newline="", errors="replace") as fh:
-        sample = fh.read(CSV_SNIFF_BYTES)
-        fh.seek(0)
-        try:
-            # Restrict candidates: unrestricted, the sniffer will happily pick
-            # a letter as the delimiter for a single-column file.
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-        except csv.Error:
-            dialect = csv.excel  # single-column files commonly fail sniffing
-        try:
-            has_header = csv.Sniffer().has_header(sample)
-        except csv.Error:
-            # Undecidable: keeping a real header beats skipping one odd row.
-            has_header = True
-        if not has_header:
-            return path.stem, ""
-        first_row = next(csv.reader(fh, dialect), [])
+    with path.open("rb") as fh:
+        raw = fh.read(CSV_SNIFF_BYTES)
+        truncated = fh.read(1) != b""
+    sample = decode_text(raw, partial=truncated)
+    try:
+        # Restrict candidates: unrestricted, the sniffer will happily pick
+        # a letter as the delimiter for a single-column file.
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel  # single-column files commonly fail sniffing
+    try:
+        has_header = csv.Sniffer().has_header(sample)
+    except csv.Error:
+        # Undecidable: keeping a real header beats skipping one odd row.
+        has_header = True
+    if not has_header:
+        return path.stem, ""
+    first_row = next(csv.reader(io.StringIO(sample, newline=""), dialect), [])
 
     columns = ", ".join(cell.strip()[:200] for cell in first_row if cell.strip())
     return path.stem, columns[:CSV_BODY_CAP]

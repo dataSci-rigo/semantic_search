@@ -242,3 +242,27 @@ def test_chunk_text_always_progresses_on_unbreakable_text():
     chunks = chunk_text(text)
     assert len(chunks) >= 3
     assert sum(len(c) for c in chunks) >= len(text)  # overlap means >= total
+
+
+# --- decode_text: legacy + unicode encodings ----------------------------------
+
+from image_search.textitems import decode_text
+
+
+def test_decode_text_handles_legacy_and_unicode_encodings():
+    spanish = "Lección de año: ¿mañana?"
+    assert decode_text(spanish.encode("cp1252")) == spanish  # pre-2019 Notepad
+    assert decode_text(spanish.encode("utf-8")) == spanish
+    assert decode_text(b"\xef\xbb\xbf" + spanish.encode("utf-8")) == spanish  # BOM dropped
+    assert decode_text(spanish.encode("utf-16")) == spanish  # BOM-marked UTF-16
+
+
+def test_decode_text_trailing_legacy_byte_is_not_mistaken_for_utf8():
+    # The only non-ASCII byte is the last one — a complete file, so it must
+    # fail UTF-8 and fall back to cp1252 rather than being silently dropped.
+    assert decode_text("Dame el café".encode("cp1252")) == "Dame el café"
+
+
+def test_decode_text_partial_prefix_cut_mid_character_stays_utf8():
+    cut = "Lección".encode("utf-8")[:6]  # "Lecci" + first byte of "ó"
+    assert decode_text(cut, partial=True) == "Lecci"

@@ -131,3 +131,25 @@ def test_duplicate_groups(tmp_path):
 
     groups = images_store.duplicate_groups(conn)
     assert groups == [("dup-id", [("f", "x/a.png"), ("f", "x/b.png")])]
+
+
+def test_walk_candidates_skips_lock_and_appledouble_files_and_sees_tif(tmp_path):
+    root = tmp_path / "d"
+    root.mkdir()
+    make_image(root / "photo.JPG")
+    Image.new("RGB", (4, 4)).save(root / "scan.tif")
+    (root / "~$report.docx").write_bytes(b"\x00" * 162)  # Office owner/lock file
+    (root / "._photo.JPG").write_bytes(b"\x00\x05\x16\x07")  # macOS AppleDouble fork
+    walked = [p.name for p, _ in images_store.walk_candidates(root)]
+    assert walked == ["photo.JPG", "scan.tif"]
+
+
+def test_default_exclude_dirs_skip_the_index_metadata_dir(tmp_path):
+    from image_search.config import DEFAULT_EXCLUDE_DIRS
+
+    root = tmp_path / "drive"
+    (root / ".semantic_search").mkdir(parents=True)
+    (root / ".semantic_search" / "scratch.txt").write_text("index working file")
+    (root / "real.txt").write_text("a real note")
+    walked = [p.name for p, _ in images_store.walk_candidates(root, DEFAULT_EXCLUDE_DIRS)]
+    assert walked == ["real.txt"]

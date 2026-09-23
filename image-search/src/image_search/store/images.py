@@ -35,7 +35,12 @@ class DiscoveredImage:
     height: int
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+# Names that carry a real extension but never real content: Office owner/
+# lock files ("~$Report.docx") and macOS AppleDouble resource forks
+# ("._IMG_1234.JPG", left by Finder on non-Mac volumes).
+_JUNK_PREFIXES = ("~$", "._")
 
 
 def _dir_excluded(name: str, patterns: Sequence[str]) -> bool:
@@ -75,6 +80,8 @@ def walk_candidates(
     for dirpath, dirnames, filenames in os.walk(folder_path, onerror=_onerror):
         dirnames[:] = sorted(d for d in dirnames if not _dir_excluded(d, exclude_dirs))
         for name in filenames:
+            if name.startswith(_JUNK_PREFIXES):
+                continue
             path = Path(dirpath) / name
             if path.suffix.lower() not in extensions:
                 continue

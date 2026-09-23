@@ -302,9 +302,47 @@ def test_document_text_vectors_land_in_vec_table(tmp_path):
     assert n == 1
 
 
-def test_document_suffixes_are_phase_one(tmp_path):
-    config = make_config(tmp_path, str(tmp_path), with_caption=True)
-    folder = config.folders[str(tmp_path)]
+def test_text_family_files_are_phase_zero(tmp_path):
+    captioned = make_config(tmp_path, str(tmp_path), with_caption=True).folders[str(tmp_path)]
     for name in ("a.pdf", "b.docx", "c.csv", "d.xlsx", "e.md", "f.links"):
-        assert _ingest_phase(folder, Path(name)) == 1
-    assert _ingest_phase(folder, Path("g.png")) == 0  # caption-pipeline image
+        assert _ingest_phase(captioned, Path(name)) == 0
+    assert _ingest_phase(captioned, Path("g.png")) == 1  # caption-pipeline image
+    plain = make_config(tmp_path, str(tmp_path), with_caption=False).folders[str(tmp_path)]
+    assert _ingest_phase(plain, Path("g.png")) == 2  # e.g. OCR-only image
+
+
+# --- text decoding: legacy Windows encodings --------------------------------
+
+
+def test_parse_note_reads_windows_1252(tmp_path):
+    path = tmp_path / "nota.txt"
+    path.write_bytes("Canción de cuna\nLa niña duerme.".encode("cp1252"))
+    title, body = textitems.parse_note(path)
+    assert title == "Canción de cuna"
+    assert "niña" in body
+
+
+def test_parse_note_reads_utf16_and_strips_utf8_bom(tmp_path):
+    wide = tmp_path / "log.txt"
+    wide.write_bytes("Año nuevo\nlínea".encode("utf-16"))  # Notepad "Unicode"
+    assert textitems.parse_note(wide) == ("Año nuevo", "Año nuevo\nlínea")
+    bom = tmp_path / "bom.md"
+    bom.write_bytes(b"\xef\xbb\xbf" + "# Título\ntexto".encode("utf-8"))
+    assert textitems.parse_note(bom)[0] == "Título"
+
+
+def test_parse_csv_reads_windows_1252_header(tmp_path):
+    path = tmp_path / "datos.csv"
+    path.write_bytes(
+        "año,dirección,teléfono\n2020,Calle 1,5551234\n2021,Calle 2,5555678\n".encode("cp1252")
+    )
+    _, body = textitems.parse_csv(path)
+    assert "año" in body and "dirección" in body and "teléfono" in body
+    assert "Calle" not in body
+
+
+def test_parse_csv_strips_excel_utf8_bom(tmp_path):
+    path = tmp_path / "export.csv"
+    path.write_bytes(b"\xef\xbb\xbf" + b"name,email,plan\nann,a@x.com,pro\nbo,b@x.com,free\n")
+    _, body = textitems.parse_csv(path)
+    assert body.startswith("name")

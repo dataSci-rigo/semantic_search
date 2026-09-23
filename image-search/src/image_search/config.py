@@ -41,6 +41,7 @@ DEFAULT_EXCLUDE_DIRS = (
     "lost+found",
     "@eaDir",
     ".git",
+    ".semantic_search",  # a drive-resident index's own config/DB/logs
 )
 
 # Which zero-shot labels make a processor worth running (labels come from

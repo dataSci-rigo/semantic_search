@@ -1045,3 +1045,52 @@ def test_long_note_gets_chunked_vectors_and_full_purge(tmp_path):
         "SELECT COUNT(*) AS n FROM vec_map WHERE image_id = ?", (essay_id,)
     ).fetchone()["n"]
     assert remaining == 0
+
+
+def test_documents_first_and_workers_released_at_phase_boundaries(tmp_path, monkeypatch):
+    """Text-family files ingest before any image (even when they sort last),
+    the OCR worker scanned PDFs may have started is released before the
+    caption phase, and the caption worker before OCR-only images."""
+    from image_search import ingest as ingest_mod
+
+    folder = tmp_path / "lib"
+    (folder / "Screenshots").mkdir(parents=True)
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(folder / "a_photo.png")  # captioned
+    Image.new("RGB", (4, 4), (4, 5, 6)).save(folder / "Screenshots" / "shot.png")  # OCR-only
+    (folder / "z_note.md").write_text("# sorts last by path\nbody\n")
+
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        f'folders:\n  "{folder}":\n    caption: fake-caption\n'
+        "    overrides:\n      Screenshots:\n        ocr: fake-ocr\n"
+    )
+    config = load_config(config_path)
+    registry = fake_registry(config)
+
+    events = []
+    real_note, real_image = ingest_mod._ingest_note, ingest_mod._ingest_image
+
+    def note(*args, **kwargs):
+        events.append("note")
+        return real_note(*args, **kwargs)
+
+    def image(*args, **kwargs):
+        events.append(f"image:{args[4].name}")
+        return real_image(*args, **kwargs)
+
+    monkeypatch.setattr(ingest_mod, "_ingest_note", note)
+    monkeypatch.setattr(ingest_mod, "_ingest_image", image)
+    monkeypatch.setattr(registry, "close_kind", lambda kind: events.append(f"close:{kind}"))
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    stats = ingest_folder(conn, config, registry, str(folder))
+
+    assert stats["failed"] == 0
+    assert events == [
+        "note",
+        "close:ocr",
+        "image:a_photo.png",
+        "close:caption",
+        "image:shot.png",
+    ]
