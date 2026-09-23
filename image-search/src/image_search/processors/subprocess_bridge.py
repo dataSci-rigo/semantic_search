@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,11 +40,21 @@ class SubprocessBridgeProcessor:
         if not self.worker_script.exists():
             raise RuntimeError(f"Worker script not found at {self.worker_script}")
 
+        # CONDA_EXE (set by conda activation on every OS) rather than bare
+        # "conda": on Windows the activated "conda" is a batch file/function
+        # that CreateProcess can't exec, so Popen(["conda", ...]) raises
+        # FileNotFoundError there.
+        conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
+        if conda_exe is None:
+            raise RuntimeError(
+                "conda executable not found: activate a conda environment "
+                "(so CONDA_EXE is set) or put conda on PATH"
+            )
         # The model id rides along as argv so one worker script can serve
         # several models (e.g. moondream2 on GPU boxes, blip-base on CPU).
         # Workers that only know one model ignore it.
         self._proc = subprocess.Popen(
-            ["conda", "run", "-n", self.env_name(), "--no-capture-output",
+            [conda_exe, "run", "-n", self.env_name(), "--no-capture-output",
              "python", str(self.worker_script), self.model_id],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

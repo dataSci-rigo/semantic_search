@@ -19,6 +19,7 @@ def test_bridge_passes_model_id_as_argv(monkeypatch, tmp_path):
             self.stdout = io.StringIO("READY\n")
 
     monkeypatch.setattr(subprocess_bridge.subprocess, "Popen", FakeProc)
+    monkeypatch.setenv("CONDA_EXE", "/opt/conda/bin/conda")
     worker = tmp_path / "worker.py"
     worker.write_text("print('READY')\n")
 
@@ -29,8 +30,28 @@ def test_bridge_passes_model_id_as_argv(monkeypatch, tmp_path):
 
     proc = Bridged("blip-base")
     proc.load()
+    # CONDA_EXE, not bare "conda": Windows' activated conda is a batch
+    # function CreateProcess can't exec.
+    assert captured["argv"][0] == "/opt/conda/bin/conda"
     assert captured["argv"][-1] == "blip-base"
     assert captured["argv"][-2] == str(worker)
+
+
+def test_bridge_missing_conda_raises_clear_error(monkeypatch, tmp_path):
+    monkeypatch.delenv("CONDA_EXE", raising=False)
+    monkeypatch.setattr(subprocess_bridge.shutil, "which", lambda _: None)
+    worker = tmp_path / "worker.py"
+    worker.write_text("print('READY')\n")
+
+    class Bridged(subprocess_bridge.SubprocessBridgeProcessor):
+        kind = "ocr"
+        worker_script = worker
+        conda_env = "some-env"
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="CONDA_EXE"):
+        Bridged("m").load()
 
 
 def test_close_tolerates_dead_worker(monkeypatch, tmp_path):
@@ -53,6 +74,7 @@ def test_close_tolerates_dead_worker(monkeypatch, tmp_path):
             return 0
 
     monkeypatch.setattr(subprocess_bridge.subprocess, "Popen", FakeProc)
+    monkeypatch.setenv("CONDA_EXE", "/opt/conda/bin/conda")
     worker = tmp_path / "worker.py"
     worker.write_text("print('READY')\n")
 
