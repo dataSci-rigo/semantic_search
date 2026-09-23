@@ -188,10 +188,19 @@ def search_text(
         embedder = registry.get("text_embed", text_embed_model)
         query_vector = embedder.embed(semantic_text)  # type: ignore[attr-defined]
         # sqlite-vec distance is ascending-better; flip sign for "higher is better".
+        # Long documents store one vector per chunk under the same id, so
+        # over-fetch and keep each id's best (first, since ascending) chunk.
         raw = vectors_store.query_nearest(
-            conn, "text", text_embed_model, query_vector, k=fetch_k
+            conn, "text", text_embed_model, query_vector, k=fetch_k * 4
         )
-        vector_hits = [(image_id, -dist) for image_id, dist in raw]
+        seen_ids: set[str] = set()
+        for image_id, dist in raw:
+            if image_id in seen_ids:
+                continue
+            seen_ids.add(image_id)
+            vector_hits.append((image_id, -dist))
+            if len(vector_hits) >= fetch_k:
+                break
 
     seen = {image_id for image_id, _ in vector_hits}
     fts_hits = [

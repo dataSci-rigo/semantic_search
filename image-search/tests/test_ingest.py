@@ -1004,3 +1004,44 @@ def test_empty_walk_with_known_files_skips_prune(tmp_path):
     forced = ingest_folder(conn, config, registry, str(folder), allow_empty_prune=True)
     assert forced["pruned"] == 1
     assert _counts(conn, "images")["images"] == 0
+
+
+def test_long_note_gets_chunked_vectors_and_full_purge(tmp_path):
+    """A note longer than one embedding window stores several vectors under
+    one item id; deleting the note removes every chunk vector."""
+    pytest.importorskip("sqlite_vec", reason="requires sqlite-vec")
+    from image_search.store.db import load_vec_extension
+
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    long_note = folder / "essay.md"
+    long_note.write_text(
+        "# A long essay\n\n" + "\n\n".join(f"Section {i}. " + "prose " * 80 for i in range(8))
+    )
+    (folder / "keep.txt").write_text("keeper so the prune guard stays open")
+
+    config = make_config(tmp_path, str(folder), with_ocr=False, with_text_embed=True)
+    registry = fake_registry(config)
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    load_vec_extension(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    per_id = {
+        r["image_id"]: r["n"]
+        for r in conn.execute(
+            "SELECT image_id, COUNT(*) AS n FROM vec_map GROUP BY image_id"
+        )
+    }
+    essay_id = conn.execute(
+        "SELECT id FROM items WHERE src_path = 'essay.md'"
+    ).fetchone()["id"]
+    assert per_id[essay_id] > 1  # chunked
+
+    long_note.unlink()
+    stats = ingest_folder(conn, config, registry, str(folder))
+    assert stats["pruned"] == 1
+    remaining = conn.execute(
+        "SELECT COUNT(*) AS n FROM vec_map WHERE image_id = ?", (essay_id,)
+    ).fetchone()["n"]
+    assert remaining == 0

@@ -164,6 +164,11 @@ folders:
 Filename matching is imperfect in both directions — check the run log, which
 names every document it excluded.
 
+Long documents are embedded in **overlapping ~1600-char chunks** (one vector
+per chunk, all under the item's id; search scores by the best chunk), since
+the text-embed models truncate at ~512 tokens and a single vector would only
+cover the opening pages. Keyword FTS always covers the full extracted text.
+
 Note for pre-existing indexes: deleted PDFs used to leave orphaned items
 behind; the first ingest after this change prunes them (a one-time bump in
 the `pruned` count).

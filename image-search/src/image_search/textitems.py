@@ -496,6 +496,50 @@ def _searchable_text(title: str, url: str | None, body: str) -> str:
     return "\n".join(part for part in (title, url or "", body) if part).strip()
 
 
+# Embedding chunk size: bge-small (and peers) truncate at 512 tokens, so a
+# single vector only "sees" a document's opening. ~1600 chars ≈ 400 tokens
+# stays safely inside the window; the overlap keeps a sentence that straddles
+# a boundary findable from either side.
+CHUNK_CHARS = 1600
+CHUNK_OVERLAP = 200
+# Break preferences, tried in order within the tail of the window.
+_CHUNK_BREAKS = ("\n\n", "\n", ". ", " ")
+
+
+def chunk_text(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split text into overlapping chunks of at most `size` chars, breaking
+    at the deepest natural boundary (paragraph > line > sentence > word)
+    found in the last 40% of the window. Text that already fits comes back
+    as a single chunk equal to the input — so short items embed exactly the
+    same bytes they did before chunking existed."""
+    text = text.strip()
+    if len(text) <= size:
+        return [text] if text else []
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = start + size
+        if end >= len(text):
+            end = len(text)
+        else:
+            window = text[start:end]
+            floor = int(size * 0.6)
+            for sep in _CHUNK_BREAKS:
+                cut = window.rfind(sep, floor)
+                if cut != -1:
+                    end = start + cut + len(sep)
+                    break
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        # Overlap, but always move forward.
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
 def insert_item(
     conn: sqlite3.Connection,
     *,
@@ -531,6 +575,16 @@ def insert_item(
             "INSERT INTO text_fts (image_id, text) VALUES (?, ?)", (item_id, text)
         )
         if text_embedder is not None:
-            vectors_store.insert_vector(
-                conn, "text", text_embedder.model_id, item_id, text_embedder.embed(text)
-            )
+            # One vector per chunk, all under the same item id: the embedder
+            # truncates at ~512 tokens, so a single vector would only cover a
+            # long document's opening. Search dedupes to the best chunk.
+            # Chunks after the first get the title prepended for context.
+            for i, chunk in enumerate(chunk_text(text)):
+                embed_input = chunk if i == 0 or not title else f"{title}\n{chunk}"
+                vectors_store.insert_vector(
+                    conn,
+                    "text",
+                    text_embedder.model_id,
+                    item_id,
+                    text_embedder.embed(embed_input),
+                )

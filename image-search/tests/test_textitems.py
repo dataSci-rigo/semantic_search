@@ -198,3 +198,47 @@ def test_json_api_is_skipped_not_indexed(monkeypatch):
     assert textitems.fetch_page("https://api.example.com/v2/data")[2] == (
         textitems.STATUS_SKIPPED
     )
+
+
+# --- chunk_text: overlapping windows for long-document embeddings ------------
+
+from image_search.textitems import CHUNK_CHARS, CHUNK_OVERLAP, chunk_text
+
+
+def test_chunk_text_short_text_is_identity():
+    text = "# Title\nA short note body."
+    assert chunk_text(text) == [text]  # byte-identical: short items embed as before
+
+
+def test_chunk_text_empty():
+    assert chunk_text("   ") == []
+
+
+def test_chunk_text_splits_long_text_with_overlap():
+    paragraphs = [f"Paragraph {i}. " + ("lorem ipsum " * 40) for i in range(12)]
+    text = "\n\n".join(paragraphs)
+    chunks = chunk_text(text)
+    assert len(chunks) > 1
+    assert all(len(c) <= CHUNK_CHARS for c in chunks)
+    # Nothing lost: every paragraph opener appears in some chunk.
+    for i in range(12):
+        assert any(f"Paragraph {i}." in c for c in chunks)
+    # Consecutive chunks overlap (shared text across the boundary).
+    assert chunks[0][-50:] in chunks[0]  # sanity
+    tail = chunks[0][-CHUNK_OVERLAP:]
+    assert any(part in chunks[1] for part in (tail[-40:], tail[:40]))
+
+
+def test_chunk_text_prefers_paragraph_breaks():
+    block = "word " * 250  # ~1250 chars
+    text = block.strip() + "\n\n" + block.strip()
+    chunks = chunk_text(text)
+    # The cut lands at the paragraph boundary, not mid-word.
+    assert chunks[0].endswith(block.strip()[-20:])
+
+
+def test_chunk_text_always_progresses_on_unbreakable_text():
+    text = "x" * (CHUNK_CHARS * 3 + 17)  # no separators at all
+    chunks = chunk_text(text)
+    assert len(chunks) >= 3
+    assert sum(len(c) for c in chunks) >= len(text)  # overlap means >= total

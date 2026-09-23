@@ -453,3 +453,64 @@ def test_clip_source_finds_images_with_no_text(tmp_path):
     assert hits[0].image_id == "img1"
     assert hits[0].source == "clip"
     assert hits[0].path.endswith("shots/one.png")  # resolved to absolute
+
+
+def test_chunked_item_appears_once_with_best_chunk(tmp_path):
+    """An item with several chunk vectors must surface once, scored by its
+    best-matching chunk."""
+    pytest.importorskip("sqlite_vec", reason="requires sqlite-vec")
+    from image_search.store import vectors as vectors_store
+    from image_search.store.db import load_vec_extension
+
+    folder = str(tmp_path / "notes")
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            folders:
+              "{folder}":
+                text_embed: fake-embed
+            """
+        )
+    )
+    config = load_config(config_path)
+
+    class FakeEmbed:
+        kind = "text_embed"
+        model_id = "fake-embed"
+
+        def load(self):
+            pass
+
+        def embed(self, text):
+            return [1.0, 0.0, 0.0]
+
+    registry = Registry(config)
+    registry._instances[("text_embed", "fake-embed")] = FakeEmbed()
+
+    conn = connect(tmp_path / "test.db")
+    migrate(conn)
+    load_vec_extension(conn)
+
+    conn.execute(
+        "INSERT INTO items (id, kind, folder, src_path, title, body, status) "
+        "VALUES ('doc1', 'pdf', ?, 'long.pdf', 'Long doc', 'body', 'ok')",
+        (folder,),
+    )
+    # Three chunks: middle one matches the query best.
+    vectors_store.insert_vector(conn, "text", "fake-embed", "doc1", [0.0, 1.0, 0.0])
+    vectors_store.insert_vector(conn, "text", "fake-embed", "doc1", [1.0, 0.0, 0.0])
+    vectors_store.insert_vector(conn, "text", "fake-embed", "doc1", [0.0, 0.0, 1.0])
+    # A second, worse-matching single-chunk item for ordering.
+    conn.execute(
+        "INSERT INTO items (id, kind, folder, src_path, title, body, status) "
+        "VALUES ('doc2', 'note', ?, 'other.md', 'Other', 'body', 'ok')",
+        (folder,),
+    )
+    vectors_store.insert_vector(conn, "text", "fake-embed", "doc2", [0.5, 0.5, 0.0])
+    conn.commit()
+
+    hits = search_text(conn, config, registry, folder, "anything", k=10)
+    ids = [h.image_id for h in hits]
+    assert ids.count("doc1") == 1  # deduped across chunks
+    assert ids[0] == "doc1"  # best chunk (exact match) outranks doc2
