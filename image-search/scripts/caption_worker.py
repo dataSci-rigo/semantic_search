@@ -67,10 +67,21 @@ LOADERS = {
 
 
 def main() -> None:
+    import os
+
     import torch
 
     # Same Pascal cuDNN9 conv2d issue as image_embed.py (docs/gpu-setup.md).
     torch.backends.cudnn.enabled = False
+
+    # The parent pipeline often runs with OMP_NUM_THREADS=1 to keep ITS
+    # memory down; inheriting that leaves CPU captioning generating on a
+    # single core. Claim most of the machine for this worker unless told
+    # otherwise.
+    threads = int(
+        os.environ.get("IMAGE_SEARCH_CAPTION_THREADS", max(1, (os.cpu_count() or 2) - 2))
+    )
+    torch.set_num_threads(threads)
 
     from PIL import Image
 
