@@ -79,8 +79,14 @@ class SubprocessBridgeProcessor:
         return response["text"]
 
     def close(self) -> None:
+        # Must never raise: it runs at phase boundaries mid-ingest, and a
+        # worker that already died (crash, OOM kill) leaves a broken pipe
+        # behind — that's exactly when cleanup matters most.
         if self._proc is not None:
-            self._proc.stdin.close()
+            try:
+                self._proc.stdin.close()
+            except OSError:
+                pass
             self._proc.terminate()
             try:
                 self._proc.wait(timeout=10)

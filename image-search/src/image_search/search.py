@@ -268,11 +268,22 @@ def search_text(
                 )
         return out
 
-    return (
-        rows_for(vector_hits, "vector")
-        + rows_for(fts_hits, "fts")
-        + rows_for(clip_hits, "clip")
-    )[:k]
+    # Round-robin the sources rather than concatenating: text-embed hits
+    # would otherwise fill k on any sizable corpus and starve the clip
+    # channel — which is the ONLY channel for images with no OCR/caption
+    # text. Scores aren't comparable across sources, so interleaving by rank
+    # is the honest merge.
+    ranked_sources = [
+        rows_for(vector_hits, "vector"),
+        rows_for(clip_hits, "clip"),
+        rows_for(fts_hits, "fts"),
+    ]
+    merged: list[SearchHit] = []
+    for tier in range(max((len(s) for s in ranked_sources), default=0)):
+        for source_rows in ranked_sources:
+            if tier < len(source_rows):
+                merged.append(source_rows[tier])
+    return merged[:k]
 
 
 def search_similar_images(
