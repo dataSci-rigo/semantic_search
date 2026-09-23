@@ -33,7 +33,11 @@ class SentenceTransformerProcessor:
     def embed(self, text: str) -> list[float]:
         """Embed arbitrary text (used for both indexing and query time)."""
         self.load()
-        return self._model.encode(text, normalize_embeddings=True).tolist()
+        # show_progress_bar=False: encode() otherwise prints a "Batches" tqdm
+        # line for every single call, which floods a long ingest run's output.
+        return self._model.encode(
+            text, normalize_embeddings=True, show_progress_bar=False
+        ).tolist()
 
     def process(self, img: LoadedImage) -> list[Record]:
         if not img.text.strip():

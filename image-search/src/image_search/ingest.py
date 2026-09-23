@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 from image_search import textitems
@@ -76,8 +77,20 @@ def ingest_folder(
     seen_paths: set[str] = set()
     failed_paths: list[str] = []
     caption_phase_open = True
+    processed = 0
+    last_report = time.monotonic()
 
     for path, mtime in walked:
+        # A heartbeat instead of per-file output: one line every ~60s says
+        # how far along the walk is and what happened so far.
+        processed += 1
+        if time.monotonic() - last_report >= 60:
+            last_report = time.monotonic()
+            logger.info(
+                "%s: %d/%d files (%d indexed, %d skipped, %d failed)",
+                folder_key, processed, len(walked),
+                stats["indexed"], stats["skipped"], stats["failed"],
+            )
         if caption_phase_open and _ingest_phase(folder, path) == 1:
             # First non-caption file: every caption job is done for this
             # folder. Free the worker's GPU memory before OCR starts.

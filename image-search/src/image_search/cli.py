@@ -50,6 +50,11 @@ def cmd_index(args: argparse.Namespace) -> None:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # Our own INFO progress stays; per-request/per-call chatter from the
+    # HTTP and model libraries does not.
+    for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub",
+                  "transformers", "sentence_transformers", "filelock"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     config = load_config(args.config)
     conn = connect(resolve_db_path(args.db, config))
     migrate(conn)

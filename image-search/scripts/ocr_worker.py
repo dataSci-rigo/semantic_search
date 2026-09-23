@@ -22,6 +22,12 @@ import sys
 
 
 def main() -> None:
+    import logging
+
+    # RapidOCR logs engine/model INFO lines to stderr, which the bridge
+    # forwards into the parent's output; keep only warnings.
+    logging.getLogger("RapidOCR").setLevel(logging.WARNING)
+
     from rapidocr import RapidOCR
 
     # GPU by default (the laptop's whole reason for a separate cuDNN 8 env);
