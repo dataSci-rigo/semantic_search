@@ -16,11 +16,11 @@ text = [
     "sentence-transformers>=3.0.0",
 ]
 # Document ingestion: pdf text layer + docx prose + xlsx sheet/column names
-# (csv uses only the stdlib). pypdf's crypto extra opens AES-encrypted PDFs
-# that only carry an owner password. pypdfium2 (scanned-PDF page rendering
-# for the OCR fallback) stays undeclared on purpose — without it those pages
-# are simply skipped.
+# (csv uses only the stdlib). pypdfium2 (PDFium) is the PDF text engine and
+# renders scanned pages for OCR; pypdf is the pure-Python fallback, with its
+# crypto extra for AES-encrypted PDFs that only carry an owner password.
 docs = [
+    "pypdfium2>=4.0",
     "pypdf[crypto]>=4.0",
     "python-docx>=1.1",
     "openpyxl>=3.1",

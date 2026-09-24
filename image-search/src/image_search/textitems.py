@@ -367,19 +367,22 @@ def sample_page_numbers(total: int, sample: int = PDF_SAMPLE_PAGES) -> list[int]
 
 def parse_pdf(path: Path, ocr_processor=None) -> tuple[str, str]:
     """(title, text) from a sample of the PDF's pages. Pages with no text
-    layer (scans) fall back to OCR when a processor is supplied."""
-    from pypdf import PdfReader
+    layer (scans) fall back to OCR when a processor is supplied.
 
-    reader = PdfReader(str(path))
-    pages = reader.pages
+    Reads through PDFium (pypdfium2) when it is installed: pure-Python pypdf
+    can grind for most of an hour on an oddly built book (an 889-page one
+    took ~50 min; PDFium reads it in ~1 s), and one stuck file stalls the
+    whole ingest. pypdf remains the fallback."""
+    try:
+        import pypdfium2
+    except ImportError:
+        meta_title, sampled = _sample_pdf_pypdf(path)
+    else:
+        meta_title, sampled = _sample_pdf_pdfium(path, pypdfium2)
+
     chunks: list[str] = []
     needs_ocr: list[int] = []
-
-    for index in sample_page_numbers(len(pages)):
-        try:
-            text = (pages[index].extract_text() or "").strip()
-        except Exception:  # noqa: BLE001 - one broken page is not fatal
-            text = ""
+    for index, text in sampled:
         if text:
             chunks.append(text)
         else:
@@ -388,15 +391,53 @@ def parse_pdf(path: Path, ocr_processor=None) -> tuple[str, str]:
     if needs_ocr and ocr_processor is not None:
         chunks.extend(_ocr_pdf_pages(path, needs_ocr, ocr_processor))
 
-    meta_title = ""
+    body = "\n".join(chunks).strip()
+    title = meta_title or path.stem
+    return title, body[:DOC_BODY_CAP]
+
+
+def _sample_pdf_pdfium(path: Path, pdfium) -> tuple[str, list[tuple[int, str]]]:
+    """(metadata title, [(page index, text)]) for the sampled pages."""
+    doc = pdfium.PdfDocument(str(path))
+    try:
+        sampled: list[tuple[int, str]] = []
+        for index in sample_page_numbers(len(doc)):
+            try:
+                page = doc[index]
+                textpage = page.get_textpage()
+                text = textpage.get_text_range().strip()
+                textpage.close()
+                page.close()
+            except Exception:  # noqa: BLE001 - one broken page is not fatal
+                text = ""
+            sampled.append((index, text))
+        try:
+            meta_title = (doc.get_metadata_dict().get("Title") or "").strip()
+        except Exception:  # noqa: BLE001 - malformed metadata is common
+            meta_title = ""
+    finally:
+        doc.close()
+    return meta_title, sampled
+
+
+def _sample_pdf_pypdf(path: Path) -> tuple[str, list[tuple[int, str]]]:
+    """Pure-Python fallback for _sample_pdf_pdfium."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    pages = reader.pages
+    sampled: list[tuple[int, str]] = []
+    for index in sample_page_numbers(len(pages)):
+        try:
+            text = (pages[index].extract_text() or "").strip()
+        except Exception:  # noqa: BLE001 - one broken page is not fatal
+            text = ""
+        sampled.append((index, text))
     try:
         meta_title = (reader.metadata.title or "").strip() if reader.metadata else ""
     except Exception:  # noqa: BLE001 - malformed metadata is common
         meta_title = ""
-
-    body = "\n".join(chunks).strip()
-    title = meta_title or path.stem
-    return title, body[:DOC_BODY_CAP]
+    return meta_title, sampled
 
 
 def parse_docx(path: Path) -> tuple[str, str]:
@@ -499,17 +540,20 @@ def _ocr_pdf_pages(path: Path, page_indexes: list[int], ocr_processor) -> list[s
         doc = pypdfium2.PdfDocument(str(path))
     except Exception:  # noqa: BLE001
         return []
-    with tempfile.TemporaryDirectory() as tmp:
-        for index in page_indexes:
-            try:
-                image = doc[index].render(scale=2).to_pil()
-                page_path = Path(tmp) / f"page{index}.png"
-                image.save(page_path)
-                text = ocr_processor._call(page_path)  # noqa: SLF001 - bridge API
-                if text.strip():
-                    out.append(text.strip())
-            except Exception:  # noqa: BLE001 - a page that won't render is skipped
-                continue
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            for index in page_indexes:
+                try:
+                    image = doc[index].render(scale=2).to_pil()
+                    page_path = Path(tmp) / f"page{index}.png"
+                    image.save(page_path)
+                    text = ocr_processor._call(page_path)  # noqa: SLF001 - bridge API
+                    if text.strip():
+                        out.append(text.strip())
+                except Exception:  # noqa: BLE001 - a page that won't render is skipped
+                    continue
+    finally:
+        doc.close()
     return out
 
 

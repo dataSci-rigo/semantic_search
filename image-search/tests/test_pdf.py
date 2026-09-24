@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import pytest
@@ -98,7 +99,18 @@ def test_invalid_exclude_regex_raises(tmp_path):
 
 # ---- extraction ------------------------------------------------------------
 
-def _write_pdf(path: Path, pages: list[str]) -> None:
+@pytest.fixture(params=["pdfium", "pypdf"])
+def pdf_engine(request, monkeypatch):
+    """Run extraction tests through both engines: PDFium when installed, and
+    the pure-pypdf fallback (pypdfium2 made unimportable)."""
+    if request.param == "pdfium":
+        pytest.importorskip("pypdfium2")
+    else:
+        monkeypatch.setitem(sys.modules, "pypdfium2", None)
+    return request.param
+
+
+def _write_pdf(path: Path, pages: list[str], title: str | None = None) -> None:
     """A real, readable PDF: one text line per page. Text needs both a
     content stream and a font resource, or extract_text() returns nothing."""
     pytest.importorskip("pypdf")
@@ -106,6 +118,8 @@ def _write_pdf(path: Path, pages: list[str]) -> None:
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
     writer = PdfWriter()
+    if title:
+        writer.add_metadata({"/Title": title})
     for text in pages:
         page = writer.add_blank_page(width=200, height=200)
         stream = DecodedStreamObject()
@@ -125,7 +139,7 @@ def _write_pdf(path: Path, pages: list[str]) -> None:
         writer.write(fh)
 
 
-def test_parse_pdf_reads_text_and_falls_back_to_stem_for_title(tmp_path):
+def test_parse_pdf_reads_text_and_falls_back_to_stem_for_title(tmp_path, pdf_engine):
     pytest.importorskip("pypdf")
     path = tmp_path / "notes on kalman filters.pdf"
     _write_pdf(path, ["state estimation", "covariance update"])
@@ -133,9 +147,19 @@ def test_parse_pdf_reads_text_and_falls_back_to_stem_for_title(tmp_path):
     title, body = textitems.parse_pdf(path)
     assert title == "notes on kalman filters"
     assert "state estimation" in body
+    assert "covariance update" in body
 
 
-def test_parse_pdf_uses_ocr_for_pages_without_text(tmp_path, monkeypatch):
+def test_parse_pdf_prefers_metadata_title(tmp_path, pdf_engine):
+    path = tmp_path / "scan0042.pdf"
+    _write_pdf(path, ["kalman gain"], title="Notes on Kalman Filters")
+
+    title, body = textitems.parse_pdf(path)
+    assert title == "Notes on Kalman Filters"
+    assert "kalman gain" in body
+
+
+def test_parse_pdf_uses_ocr_for_pages_without_text(tmp_path, monkeypatch, pdf_engine):
     """A scanned page has no text layer; the OCR processor fills the gap."""
     pytest.importorskip("pypdf")
     path = tmp_path / "scan.pdf"
@@ -157,7 +181,7 @@ def test_parse_pdf_uses_ocr_for_pages_without_text(tmp_path, monkeypatch):
     assert calls and calls[0][1] == (0, 1)
 
 
-def test_parse_pdf_without_ocr_processor_returns_empty_body(tmp_path):
+def test_parse_pdf_without_ocr_processor_returns_empty_body(tmp_path, pdf_engine):
     pytest.importorskip("pypdf")
     path = tmp_path / "scan.pdf"
     _write_pdf(path, ["", ""])
