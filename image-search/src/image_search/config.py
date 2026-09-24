@@ -25,7 +25,16 @@ PROCESSOR_KEYS = (
 )
 
 # Non-processor keys allowed in a folder/override block.
-ROUTING_KEYS = ("route", "ocr_when", "caption_when", "exclude_patterns")
+ROUTING_KEYS = (
+    "route", "ocr_when", "caption_when", "exclude_patterns",
+    "text_exts", "skip_dirs",
+)
+
+# Directory names never worth walking in a documents/code folder.
+DEFAULT_SKIP_DIRS = (
+    ".git", "__pycache__", "venv", ".venv", "node_modules", ".cache",
+    "data", "output", ".pytest_cache", "dist", "build",
+)
 
 # Which zero-shot labels make a processor worth running (labels come from
 # processors/tagger.py LABEL_PROMPTS).
@@ -78,6 +87,11 @@ class FolderConfig:
     # financial/tax patterns — tax records shouldn't land behind the same
     # search box as memes. Set `exclude_patterns: []` to index everything.
     exclude_patterns: tuple[str, ...] | None = None
+    # Extra file extensions ingested as text notes (code/docs folders), e.g.
+    # [".py", ".sh"]. Empty = notes/.links/PDFs only, the classic behavior.
+    text_exts: tuple[str, ...] = ()
+    # Directory names pruned from the walk (code folders are full of venvs).
+    skip_dirs: tuple[str, ...] = DEFAULT_SKIP_DIRS
 
     def enabled(self, kind: str) -> str | None:
         return self.processors.get(kind)
@@ -164,6 +178,19 @@ def _parse_routing(block: dict, context: str) -> Routing:
     )
 
 
+def _parse_str_list(
+    block: dict, key: str, context: str, default: tuple[str, ...]
+) -> tuple[str, ...]:
+    value = block.get(key)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{key} in {context} must be a list of strings, got {value!r}")
+    return tuple(value)
+
+
 def _parse_excludes(block: dict, context: str) -> tuple[str, ...] | None:
     """None means "use the built-in financial/tax patterns"; an explicit list
     (including an empty one) replaces them."""
@@ -247,6 +274,12 @@ def load_config(path: str | Path) -> SearchConfig:
             overrides=overrides,
             routing=_parse_routing(folder_raw, f"folder {folder_key!r}"),
             exclude_patterns=_parse_excludes(folder_raw, f"folder {folder_key!r}"),
+            text_exts=_parse_str_list(
+                folder_raw, "text_exts", f"folder {folder_key!r}", ()
+            ),
+            skip_dirs=_parse_str_list(
+                folder_raw, "skip_dirs", f"folder {folder_key!r}", DEFAULT_SKIP_DIRS
+            ),
         )
 
     config = SearchConfig(

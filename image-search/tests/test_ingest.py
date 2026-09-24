@@ -699,10 +699,10 @@ def test_failing_folder_does_not_stop_other_folders(tmp_path, monkeypatch):
 
     real_walk = images_store.walk_candidates
 
-    def exploding_walk(folder_path):
+    def exploding_walk(folder_path, **kwargs):
         if folder_path == bad:
             raise PermissionError("simulated unreadable folder")
-        return real_walk(folder_path)
+        return real_walk(folder_path, **kwargs)
 
     monkeypatch.setattr(ingest_mod.images_store, "walk_candidates", exploding_walk)
 

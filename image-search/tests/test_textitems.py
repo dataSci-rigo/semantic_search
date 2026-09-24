@@ -198,3 +198,85 @@ def test_json_api_is_skipped_not_indexed(monkeypatch):
     assert textitems.fetch_page("https://api.example.com/v2/data")[2] == (
         textitems.STATUS_SKIPPED
     )
+
+
+# ---- chunked embeddings ----------------------------------------------------
+
+
+def test_chunk_text_small_returns_whole():
+    from image_search.textitems import chunk_text
+
+    assert chunk_text("short note") == ["short note"]
+    assert chunk_text("   ") == []
+
+
+def test_chunk_text_splits_on_paragraphs_with_overlap():
+    from image_search.textitems import chunk_text
+
+    paras = [
+        f"Paragraph {i}. " + " ".join(f"w{i}x{j}" for j in range(60))
+        for i in range(12)
+    ]
+    text = "\n\n".join(paras)
+    chunks = chunk_text(text, target=1000, overlap=150)
+    assert len(chunks) > 1
+    assert all(len(c) <= 1000 for c in chunks)
+    # Nothing lost: every paragraph's head appears in some chunk.
+    for para in paras:
+        head = para[:40]
+        assert any(head in c for c in chunks)
+    # Consecutive chunks overlap (tokens are unique, so this is meaningful).
+    assert all(chunks[i][-30:] in chunks[i + 1] for i in range(len(chunks) - 1))
+
+
+def test_long_note_gets_chunk_vectors_and_one_search_hit(tmp_path):
+    import sqlite3
+
+    from image_search.config import load_config
+    from image_search.registry import Registry
+    from image_search.ingest import ingest_folder
+    from image_search.search import search_text
+    from image_search.store.db import connect, migrate
+
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    body = "\n\n".join(
+        f"Section {i}. " + " ".join(f"tok{i}x{j}" for j in range(80))
+        for i in range(10)
+    )
+    (folder / "big.md").write_text(f"# Big Note\n\n{body}")
+
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(
+        f'folders:\n  "{folder}":\n    text_embed: fake-embed\n'
+    )
+    config = load_config(config_path)
+    registry = Registry(config)
+
+    class FakeEmbed:
+        kind, model_id = "text_embed", "fake-embed"
+        def load(self): pass
+        def embed(self, text): return [float(len(text) % 7), 1.0, 0.0]
+        def process(self, img): return []
+
+    registry._instances[("text_embed", "fake-embed")] = FakeEmbed()
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    ingest_folder(conn, config, registry, str(folder))
+
+    chunk_rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM vec_map WHERE image_id LIKE '%#c%'"
+    ).fetchone()["n"]
+    assert chunk_rows > 1  # long note stored as multiple chunk vectors
+
+    hits = search_text(conn, config, registry, str(folder), "tok5x40", k=10)
+    ids = [h.image_id for h in hits]
+    assert len(ids) == len(set(ids)) == 1  # chunks resolve to ONE parent item
+    assert "#c" not in ids[0]
+    assert hits[0].title == "Big Note"
+
+    # Deleting the file purges chunk vectors too.
+    (folder / "big.md").unlink()
+    ingest_folder(conn, config, registry, str(folder))
+    left = conn.execute("SELECT COUNT(*) AS n FROM vec_map").fetchone()["n"]
+    assert left == 0

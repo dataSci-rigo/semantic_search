@@ -23,6 +23,39 @@ NOTE_EXTENSIONS = {".md", ".txt"}
 LINKS_EXTENSION = ".links"
 PDF_EXTENSION = ".pdf"
 
+# Chunked embedding: bge-small truncates around 512 tokens (~2,000 chars), so
+# a whole document in one vector loses everything past its opening — measured
+# on this index, ~75% of the average note/pdf body was semantically invisible.
+# Chunks are embedded separately (ids "<item_id>#c<N>"); FTS keeps full text.
+CHUNK_TARGET = 1400   # chars per chunk, before the boundary search
+CHUNK_OVERLAP = 200   # tail of each chunk repeated at the next chunk's head
+
+
+def chunk_text(text: str, target: int = CHUNK_TARGET, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split text into overlapping chunks, preferring paragraph then line
+    boundaries near the target size. Small texts come back whole."""
+    text = text.strip()
+    if len(text) <= target:
+        return [text] if text else []
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + target, len(text))
+        if end < len(text):
+            # Cut at the last paragraph break in the window, else line break,
+            # else hard cut. Never cut before the window's halfway point.
+            window = text[start:end]
+            for sep in ("\n\n", "\n", " "):
+                cut = window.rfind(sep)
+                if cut >= target // 2:
+                    end = start + cut
+                    break
+        chunks.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return [c for c in chunks if c]
+
 FETCH_TIMEOUT = 10
 FETCH_BODY_CAP = 5000
 FETCH_SIZE_CAP = 1 << 20  # 1 MB — enough for any article's HTML
@@ -431,6 +464,15 @@ def insert_item(
             "INSERT INTO text_fts (image_id, text) VALUES (?, ?)", (item_id, text)
         )
         if text_embedder is not None:
-            vectors_store.insert_vector(
-                conn, "text", text_embedder.model_id, item_id, text_embedder.embed(text)
-            )
+            # One vector per chunk so long documents are searchable past the
+            # embedder's token limit. Chunk ids resolve back to the parent
+            # item in search.py (parent_item_id). The title is prepended to
+            # every chunk so context survives the split.
+            chunks = chunk_text(text)
+            for i, chunk in enumerate(chunks):
+                chunk_id = item_id if len(chunks) == 1 else f"{item_id}#c{i}"
+                payload = chunk if chunk.startswith(title) else f"{title}\n{chunk}"
+                vectors_store.insert_vector(
+                    conn, "text", text_embedder.model_id, chunk_id,
+                    text_embedder.embed(payload),
+                )

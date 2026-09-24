@@ -48,16 +48,22 @@ def insert_vector(
 
 def delete_vectors(conn: sqlite3.Connection, image_id: str) -> int:
     """Remove every stored vector for an image_id across all (space, model)
-    partitions, via the vec_map sidecar. Returns the number removed."""
+    partitions, via the vec_map sidecar — including per-chunk vectors
+    ("<id>#c<N>", see textitems.insert_item). Returns the number removed."""
     rows = conn.execute(
-        "SELECT vec_table, rowid AS r FROM vec_map WHERE image_id = ?", (image_id,)
+        "SELECT vec_table, rowid AS r FROM vec_map WHERE image_id = ? "
+        "OR image_id LIKE ? ESCAPE '\\'",
+        (image_id, image_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "#c%"),
     ).fetchall()
     if not rows:
         return 0
     load_vec_extension(conn)
     for row in rows:
         conn.execute(f'DELETE FROM {row["vec_table"]} WHERE rowid = ?', (row["r"],))
-    conn.execute("DELETE FROM vec_map WHERE image_id = ?", (image_id,))
+        conn.execute(
+            "DELETE FROM vec_map WHERE vec_table = ? AND rowid = ?",
+            (row["vec_table"], row["r"]),
+        )
     return len(rows)
 
 

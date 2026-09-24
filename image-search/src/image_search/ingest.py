@@ -42,7 +42,9 @@ def ingest_folder(
 
     Returns counts, including "failed"."""
     folder = config.folders[folder_key]
-    walked = images_store.walk_candidates(folder.path)
+    walked = images_store.walk_candidates(
+        folder.path, extra_extensions=folder.text_exts, skip_dirs=folder.skip_dirs
+    )
     known = images_store.load_file_state(conn, folder_key)
 
     # Phase the walk: caption-pipeline images first, everything else (OCR
@@ -77,12 +79,16 @@ def ingest_folder(
 
         try:
             suffix = path.suffix.lower()
-            if suffix in textitems.NOTE_EXTENSIONS:
+            if suffix in textitems.NOTE_EXTENSIONS or suffix in folder.text_exts:
                 indexed = _ingest_note(conn, registry, folder, folder_key, path, mtime)
             elif suffix == textitems.LINKS_EXTENSION:
                 indexed = _ingest_links(conn, registry, folder, folder_key, path, mtime)
             elif suffix == textitems.PDF_EXTENSION:
                 indexed = _ingest_pdf(conn, registry, folder, folder_key, path, mtime)
+            elif not _wants_images(folder, path):
+                # A documents/code folder with no image processors: images in
+                # its tree would index as empty, unfindable rows — skip them.
+                indexed = False
             else:
                 indexed = _ingest_image(conn, registry, folder, folder_key, path, mtime)
             stats["indexed" if indexed else "skipped"] += 1
@@ -112,12 +118,19 @@ def _ingest_phase(folder: FolderConfig, path: Path) -> int:
     else. Non-image files are all phase 1 — notes/links are cheap, and PDFs
     use the OCR worker, so they belong with the OCR phase."""
     suffix = path.suffix.lower()
-    if suffix in textitems.NOTE_EXTENSIONS or suffix in (
-        textitems.LINKS_EXTENSION,
-        textitems.PDF_EXTENSION,
+    if (
+        suffix in textitems.NOTE_EXTENSIONS
+        or suffix in folder.text_exts
+        or suffix in (textitems.LINKS_EXTENSION, textitems.PDF_EXTENSION)
     ):
         return 1
     return 0 if "caption" in folder.processors_for_path(path) else 1
+
+
+def _wants_images(folder: FolderConfig, path: Path) -> bool:
+    """Does any image-consuming processor apply to this path?"""
+    processors = folder.processors_for_path(path)
+    return any(k in processors for k in ("image_embed", "ocr", "caption", "tagger"))
 
 
 def _text_embedder(registry: Registry, folder: FolderConfig, path: Path):

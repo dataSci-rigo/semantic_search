@@ -6,7 +6,38 @@ defaults:
   # face_model: buffalo_l
   # face_detect: scrfd_10g
 
+# Folder order = ingest order (ingest_all walks this dict in order). Text
+# folders come first: they index in minutes, so document/code search stays
+# fresh even while the photo library is mid-marathon on the GPU.
 folders:
+  # Documents & code, semantically searchable (chunked text embeddings).
+  # No image processors here — images inside these trees are skipped.
+  "~/Documents":
+    caption: off
+    image_embed: off
+    text_exts: [".py", ".sh", ".js", ".ts", ".html", ".css", ".yaml", ".yml", ".toml", ".ipynb", ".sql"]
+    skip_dirs: [".git", "__pycache__", "venv", ".venv", "node_modules", ".cache",
+                "data", "output", ".pytest_cache", "dist", "build", "data_backups",
+                "script_data"]
+  "~/ch":
+    caption: off
+    image_embed: off
+  "~/claude":
+    caption: off
+    image_embed: off
+  # Memory, plans, skills docs. Transcripts (.jsonl) are excluded by
+  # extension already; skip_dirs drops the non-content machinery.
+  "~/.claude":
+    caption: off
+    image_embed: off
+    skip_dirs: [".git", "__pycache__", "shell-snapshots", "todos", "statsig",
+                "downloads", "file-history", "session-env", "ide"]
+  # Takeout products other than Google Photos (GoogleVault lives under
+  # ~/Documents and is covered by that folder).
+  "~/takeout_other":
+    caption: off
+    image_embed: off
+
   # Whole photo library. Nested "Screenshots" dirs (there are several,
   # scattered under dw2/, pix3/, pix3/Pictures/, and the top-level one) get
   # OCR instead of caption/image_embed via the path override below — see

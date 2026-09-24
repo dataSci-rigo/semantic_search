@@ -198,6 +198,38 @@ def api_search():
     )
 
 
+@app.route("/api/inventory")
+def api_inventory():
+    """Every indexed file as {id (= sha256 of its bytes), path, folder, mtime},
+    paginated with ?offset=&limit= (max 5000; "next" is the following offset
+    or null). Lets another machine deduplicate against this index — e.g. the
+    google_exit_status.py --check-index http://host:port — without moving a
+    single file. Guest mode hides the same ids as every other route."""
+    try:
+        offset = max(0, int(request.args.get("offset", 0)))
+        limit = max(1, min(5000, int(request.args.get("limit", 5000))))
+    except ValueError:
+        return jsonify({"ok": False, "error": "offset/limit must be integers"}), 400
+    conn = _db()
+    try:
+        excluded = _excluded(conn) or set()
+        rows = conn.execute(
+            "SELECT path, image_id, folder, mtime FROM files ORDER BY path LIMIT ? OFFSET ?",
+            (limit + 1, offset),
+        ).fetchall()
+    finally:
+        conn.close()
+    more = len(rows) > limit
+    items = [
+        {"id": r["image_id"], "path": r["path"], "folder": r["folder"], "mtime": r["mtime"]}
+        for r in rows[:limit] if r["image_id"] not in excluded
+    ]
+    return jsonify(
+        {"ok": True, "offset": offset, "count": len(items),
+         "next": (offset + limit) if more else None, "items": items}
+    )
+
+
 @app.route("/api/save", methods=["POST"])
 def api_save():
     """Capture endpoint for external savers (e.g. the Discord bot): drop an

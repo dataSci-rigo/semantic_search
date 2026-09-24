@@ -32,21 +32,33 @@ class DiscoveredImage:
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"}
 
 
-def walk_candidates(folder_path: Path) -> list[tuple[Path, float]]:
+def walk_candidates(
+    folder_path: Path,
+    extra_extensions: tuple[str, ...] = (),
+    skip_dirs: tuple[str, ...] = (),
+) -> list[tuple[Path, float]]:
     """Stat-only walk: (path, mtime) for every ingestible file (images plus
-    note/.links text files), sorted by path. No hashing here — ingest hashes
-    only paths whose mtime changed."""
+    note/.links text files, plus a folder's `text_exts`), sorted by path,
+    pruning `skip_dirs` subtrees (venvs, .git...). No hashing here — ingest
+    hashes only paths whose mtime changed."""
+    import os
+
     from image_search.textitems import LINKS_EXTENSION, NOTE_EXTENSIONS, PDF_EXTENSION
 
     extensions = IMAGE_EXTENSIONS | NOTE_EXTENSIONS | {LINKS_EXTENSION, PDF_EXTENSION}
+    extensions |= {ext.lower() for ext in extra_extensions}
+    skips = set(skip_dirs)
     out: list[tuple[Path, float]] = []
     if not folder_path.exists():
         return out
-    for path in sorted(folder_path.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in extensions:
-            continue
-        out.append((path, path.stat().st_mtime))
-    return out
+    for dirpath, dirnames, filenames in os.walk(folder_path):
+        dirnames[:] = sorted(d for d in dirnames if d not in skips)
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            if path.suffix.lower() not in extensions or not path.is_file():
+                continue
+            out.append((path, path.stat().st_mtime))
+    return sorted(out)
 
 
 def describe(path: Path, folder_key: str, mtime: float) -> DiscoveredImage:

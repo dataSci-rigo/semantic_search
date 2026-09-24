@@ -188,6 +188,17 @@ def search_text(
             conn, "text", text_embed_model, query_vector, k=fetch_k
         )
         vector_hits = [(image_id, -dist) for image_id, dist in raw]
+        # Chunked documents put several vectors in the index under
+        # "<item_id>#c<N>" ids (textitems.insert_item). Resolve each hit to
+        # its parent item and keep only its best-ranked chunk.
+        deduped: list[tuple[str, float]] = []
+        seen_parents: set[str] = set()
+        for chunk_id, score in vector_hits:
+            parent = chunk_id.split("#c", 1)[0]
+            if parent not in seen_parents:
+                seen_parents.add(parent)
+                deduped.append((parent, score))
+        vector_hits = deduped
 
     seen = {image_id for image_id, _ in vector_hits}
     fts_hits = [
