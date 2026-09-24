@@ -41,6 +41,27 @@ def resolve_db_path(cli_db: str | None, config: SearchConfig) -> str:
     return str(FALLBACK_DB)
 
 
+# SetThreadExecutionState flags (winbase.h).
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def keep_awake() -> bool:
+    """Ask Windows not to idle into sleep while this process runs; returns
+    whether a request was made. On Modern Standby laptops the display timing
+    out IS standby, and standby suspends desktop programs — even on AC with
+    sleep set to "never" — so the display must be held on too, or a long
+    index silently pauses for hours. The request dies with the process; no
+    power setting is changed. Lid close / power button still sleep."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+    return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
+
+
 def cmd_index(args: argparse.Namespace) -> None:
     # Stream per-file failures to stderr as they happen: a full-library index
     # runs for days, so deferring them to the end (as the warning capture
@@ -55,6 +76,11 @@ def cmd_index(args: argparse.Namespace) -> None:
     for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub",
                   "transformers", "sentence_transformers", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    if not args.allow_sleep and keep_awake():
+        logging.getLogger(__name__).info(
+            "holding the system and display awake until indexing ends "
+            "(--allow-sleep to opt out)"
+        )
     config = load_config(args.config)
     conn = connect(resolve_db_path(args.db, config))
     migrate(conn)
@@ -273,6 +299,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow pruning a folder's whole index when the walk finds nothing "
         "(normally skipped — an empty walk usually means an unplugged drive)",
+    )
+    p_index.add_argument(
+        "--allow-sleep",
+        action="store_true",
+        help="Windows: let the machine idle into sleep/standby mid-run (by "
+        "default indexing holds the system and display awake)",
     )
     p_index.set_defaults(func=cmd_index)
 

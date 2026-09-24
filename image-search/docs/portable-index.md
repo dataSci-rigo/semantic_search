@@ -33,6 +33,11 @@ image-search --config D:\.semantic_search\folders.yaml index
 DB path precedence everywhere (CLI and webapp): `--db` flag >
 `IMAGE_SEARCH_DB` > the config's `db:` key > `<project>/data/pictures_index.db`.
 
+On Windows, `index` holds the system and display awake until it finishes:
+on Modern Standby laptops the screen timing out *is* standby, which suspends
+the indexer for hours even on AC. The request ends with the process (no power
+setting changes); `--allow-sleep` opts out. Closing the lid still sleeps.
+
 The first run per machine downloads the models to the HuggingFace cache
 (network needed once). The receiving machine must have the same model ids
 available — vector tables are named after them.
