@@ -32,6 +32,8 @@ def main() -> None:
 
     from rapidocr import RapidOCR
 
+    from image_io import open_rgb  # scripts/image_io.py, beside this file
+
     # GPU by default (the laptop's whole reason for a separate cuDNN 8 env);
     # set IMAGE_SEARCH_OCR_USE_CUDA=0 on CPU-only machines, where onnxruntime
     # would otherwise fail to find a CUDA provider.
@@ -44,7 +46,11 @@ def main() -> None:
         if not path:
             continue
         try:
-            result = engine(path)
+            # 1600px long side: measured ~25-33% faster than full-resolution
+            # camera photos with no loss of recognized text (1280 lost ~20%
+            # on photos). Scanned PDF pages render at ~1584px, so they pass
+            # through unshrunk.
+            result = engine(open_rgb(path, max_side=1600))
             text = "\n".join(result.txts) if result.txts else ""
             print(json.dumps({"text": text}), flush=True)
         except Exception as exc:  # noqa: BLE001 - report to parent, keep serving

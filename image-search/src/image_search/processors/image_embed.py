@@ -55,9 +55,11 @@ class SiglipImageEmbedProcessor:
         """Embed an image file (used for both indexing and query-by-image)."""
         self.load()
         import torch
-        from PIL import Image
 
-        img = Image.open(path).convert("RGB")
+        from image_search.image_io import open_rgb
+
+        # 1024px covers every supported model's input (224-512) with room to spare.
+        img = open_rgb(path, max_side=1024)
         inputs = self._processor(images=img, return_tensors="pt").to(self._device)
         if self._dtype is not None:
             inputs = inputs.to(self._dtype)  # casts floating tensors only

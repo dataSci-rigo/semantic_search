@@ -83,7 +83,7 @@ def main() -> None:
     )
     torch.set_num_threads(threads)
 
-    from PIL import Image
+    from image_io import open_rgb  # scripts/image_io.py, beside this file
 
     model_id = sys.argv[1] if len(sys.argv) > 1 else "moondream2"
     loader = LOADERS.get(model_id)
@@ -104,7 +104,8 @@ def main() -> None:
         if not path:
             continue
         try:
-            img = Image.open(path).convert("RGB")
+            # 1024px: BLIP resizes to 384, moondream2 tiles 378px crops.
+            img = open_rgb(path, max_side=1024)
             print(json.dumps({"text": caption(img)}), flush=True)
         except Exception as exc:  # noqa: BLE001 - report to parent, keep serving
             print(json.dumps({"error": str(exc)}), flush=True)
