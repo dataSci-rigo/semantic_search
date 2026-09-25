@@ -24,12 +24,6 @@ import sys
 def main() -> None:
     import logging
 
-    # RapidOCR logs to stderr, which the bridge forwards into the parent's
-    # output: INFO engine banners, plus a WARNING for every image with no
-    # text ("text detection result is empty") — tens of thousands of lines
-    # over a photo library. Keep only real errors.
-    logging.getLogger("RapidOCR").setLevel(logging.ERROR)
-
     from rapidocr import RapidOCR
 
     from image_io import open_rgb  # scripts/image_io.py, beside this file
@@ -39,6 +33,11 @@ def main() -> None:
     # would otherwise fail to find a CUDA provider.
     use_cuda = os.environ.get("IMAGE_SEARCH_OCR_USE_CUDA", "1") not in ("0", "false", "")
     engine = RapidOCR(params={"EngineConfig.onnxruntime.use_cuda": use_cuda})
+    # RapidOCR logs to stderr, which the bridge forwards into the parent's
+    # output: INFO banners plus a WARNING for every image with no text —
+    # tens of thousands of lines over a photo library. Set after import and
+    # engine construction: RapidOCR configures its logger's level itself.
+    logging.getLogger("RapidOCR").setLevel(logging.ERROR)
     print("READY", flush=True)
 
     for line in sys.stdin:

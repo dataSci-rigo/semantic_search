@@ -4,7 +4,11 @@ two in step; tests/test_image_io.py runs both."""
 
 from __future__ import annotations
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile, ImageOps
+
+# Keep the readable part of truncated files (a failing drive leaves many)
+# rather than rejecting the whole image.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def open_rgb(path, max_side: int) -> Image.Image:

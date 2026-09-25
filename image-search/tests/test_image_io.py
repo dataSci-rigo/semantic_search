@@ -51,3 +51,12 @@ def test_exif_orientation_survives_a_reduced_scale_decode(tmp_path, open_rgb):
     exif[0x0112] = 6
     Image.new("RGB", (4000, 3000)).save(path, exif=exif)
     assert open_rgb(path, max_side=1000).size == (750, 1000)
+
+
+def test_truncated_jpeg_still_decodes(tmp_path, open_rgb):
+    # A copy cut short by bad sectors keeps its readable part.
+    full = tmp_path / "full.jpg"
+    Image.new("RGB", (800, 600), (10, 200, 30)).save(full, quality=95)
+    cut = tmp_path / "cut.jpg"
+    cut.write_bytes(full.read_bytes()[: full.stat().st_size // 2])
+    assert open_rgb(cut, max_side=1024).size == (800, 600)
