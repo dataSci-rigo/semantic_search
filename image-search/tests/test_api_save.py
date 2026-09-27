@@ -96,3 +96,12 @@ def test_files_inventory_pages_and_looks_up_by_hash(tmp_path, monkeypatch):
 
     copies = client.get("/api/files?sha256=H1").get_json()["files"]
     assert sorted(f["path"] for f in copies) == ["a.jpg", "c.jpg"]
+
+
+def test_manifest_download(tmp_path, monkeypatch):
+    mod = _load_app(tmp_path, monkeypatch)
+    client = mod.app.test_client()
+    assert client.get("/api/manifest.csv").status_code == 404
+    (tmp_path / "sha256-manifest.csv").write_text("sha256,size_bytes,path\nab,3,x.jpg\n")
+    resp = client.get("/api/manifest.csv")
+    assert resp.status_code == 200 and b"ab,3,x.jpg" in resp.data

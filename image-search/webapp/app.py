@@ -248,6 +248,20 @@ def api_files():
     return jsonify({"ok": True, "total_indexed_files": total, "files": files, "next": next_cursor})
 
 
+@app.route("/api/manifest.csv")
+def api_manifest():
+    """The full sha256,size_bytes,path manifest of every file under the
+    indexed root (written beside the DB by a manifest job), for dedup tools
+    that need files the index doesn't cover (.doc, .heic, ...)."""
+    from flask import send_file
+
+    manifest = Path(DB_PATH).parent / "sha256-manifest.csv"
+    if not manifest.exists():
+        abort(404, "no manifest has been generated for this index")
+    return send_file(manifest, mimetype="text/csv", as_attachment=True,
+                     download_name="sha256-manifest.csv")
+
+
 @app.route("/api/save", methods=["POST"])
 def api_save():
     """Capture endpoint for external savers (e.g. the Discord bot): drop an
