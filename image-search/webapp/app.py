@@ -202,6 +202,52 @@ def api_search():
     )
 
 
+FILES_PAGE_MAX = 5000
+
+
+@app.route("/api/files")
+def api_files():
+    """Read-only inventory for cross-machine dedup: every indexed file as
+    (folder, relative path, sha256 of its bytes, mtime), paged in path order.
+    ?sha256=<hex> instead returns every path holding that content. Hashes are
+    the same content ids ingest computes everywhere, so another machine can
+    count copies of a file without transferring it."""
+    conn = _db()
+    try:
+        hidden = _excluded(conn) or set()
+        sha = request.args.get("sha256", "").strip().lower()
+        if sha:
+            rows = conn.execute(
+                "SELECT folder, path, image_id, mtime FROM files WHERE image_id = ? "
+                "ORDER BY folder, path",
+                (sha,),
+            ).fetchall()
+            next_cursor = None
+        else:
+            try:
+                limit = max(1, min(FILES_PAGE_MAX, int(request.args.get("limit", 1000))))
+            except ValueError:
+                return jsonify({"ok": False, "error": "limit must be an integer"}), 400
+            # Paged within one folder: (folder, path) is the key, so a path
+            # cursor is exact there.
+            folder = _folder_from_request()
+            rows = conn.execute(
+                "SELECT folder, path, image_id, mtime FROM files "
+                "WHERE folder = ? AND path > ? ORDER BY path LIMIT ?",
+                (folder, request.args.get("after", ""), limit),
+            ).fetchall()
+            next_cursor = rows[-1]["path"] if len(rows) == limit else None
+        total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    finally:
+        conn.close()
+    files = [
+        {"folder": r["folder"], "path": r["path"], "sha256": r["image_id"], "mtime": r["mtime"]}
+        for r in rows
+        if r["image_id"] not in hidden
+    ]
+    return jsonify({"ok": True, "total_indexed_files": total, "files": files, "next": next_cursor})
+
+
 @app.route("/api/save", methods=["POST"])
 def api_save():
     """Capture endpoint for external savers (e.g. the Discord bot): drop an

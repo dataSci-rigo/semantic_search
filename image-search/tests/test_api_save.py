@@ -73,3 +73,26 @@ def test_save_rejects_empty_and_unconfigured(tmp_path, monkeypatch):
     resp = client.post("/api/save", json={"url": "https://example.com"})
     assert resp.status_code == 400
     assert "IMAGE_SEARCH_SAVE_DIR" in resp.get_json()["error"]
+
+
+def test_files_inventory_pages_and_looks_up_by_hash(tmp_path, monkeypatch):
+    mod = _load_app(tmp_path, monkeypatch)
+    from image_search.store import images as images_store
+    from image_search.store.db import connect
+
+    folder = next(iter(mod._config.folders))
+    conn = connect(tmp_path / "index.db")
+    for name, sha in (("a.jpg", "h1"), ("b.jpg", "h2"), ("c.jpg", "h1")):
+        images_store.upsert_file(conn, name, folder, sha, 1.0)
+    conn.commit()
+    conn.close()
+    client = mod.app.test_client()
+
+    first = client.get("/api/files?limit=2").get_json()
+    assert [f["path"] for f in first["files"]] == ["a.jpg", "b.jpg"]
+    assert first["total_indexed_files"] == 3 and first["next"] == "b.jpg"
+    rest = client.get(f"/api/files?limit=2&after={first['next']}").get_json()
+    assert [f["path"] for f in rest["files"]] == ["c.jpg"] and rest["next"] is None
+
+    copies = client.get("/api/files?sha256=H1").get_json()["files"]
+    assert sorted(f["path"] for f in copies) == ["a.jpg", "c.jpg"]
