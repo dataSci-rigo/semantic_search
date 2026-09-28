@@ -304,12 +304,16 @@ def _ingest_document(
         ocr_model = folder.processors_for_path(path).get("ocr")
         ocr_processor = registry.get("ocr", ocr_model) if ocr_model else None
         title, body = textitems.parse_pdf(path, ocr_processor=ocr_processor)
-    elif kind == "docx":
-        title, body = textitems.parse_docx(path)
-    elif kind == "csv":
-        title, body = textitems.parse_csv(path)
     else:
-        title, body = textitems.parse_xlsx(path)
+        parser = {
+            "docx": textitems.parse_docx,
+            "doc": textitems.parse_doc,
+            "pptx": textitems.parse_pptx,
+            "ppt": textitems.parse_ppt,
+            "csv": textitems.parse_csv,
+            "xlsx": textitems.parse_xlsx,
+        }[kind]
+        title, body = parser(path)
 
     # Second gate, on the text itself: filenames don't announce what a
     # document contains. Only applies where the folder is using the built-in

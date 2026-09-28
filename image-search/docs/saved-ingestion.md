@@ -138,7 +138,12 @@ image-search[docs]`, i.e. pypdf + python-docx + openpyxl):
   scanned pages are skipped).
 - **`.docx`** — title from the first Heading/Title paragraph (else document
   metadata, else filename) plus the paragraph prose, capped at 20k chars.
-  Tables are skipped. Legacy `.doc` is not supported.
+  Tables are skipped.
+- **`.doc`** (Word 97–2003 and Word 6/95) — the main document text, read from
+  the binary format directly (no Office install needed); `.doc` files that
+  are really RTF or plain text are read as such. Title is the file name.
+- **`.pptx` / `.ppt`** — slide text in order; title is the metadata title
+  (.pptx) or the deck's first line (.ppt).
 - **`.csv`** — the filename and its **column names only. Row data is never
   read into the index.** A file whose first row looks like data (no header)
   is stored as a thin item and excluded from results.

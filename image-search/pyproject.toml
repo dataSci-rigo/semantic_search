@@ -23,6 +23,8 @@ docs = [
     "pypdfium2>=4.0",
     "pypdf[crypto]>=4.0",
     "python-docx>=1.1",
+    "python-pptx>=0.6",
+    "olefile>=0.46",  # legacy .doc/.ppt (OLE compound files)
     "openpyxl>=3.1",
 ]
 # Phase 2: image embedding (SigLIP2, via `transformers`, already covers `text`'s deps).

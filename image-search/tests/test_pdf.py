@@ -239,3 +239,15 @@ def test_explicit_exclude_patterns_disable_the_content_gate(tmp_path):
         'folders:\n  "~/X":\n    text_embed: x\n    exclude_patterns: []\n'
     )
     assert load_config(config_path).folders["~/X"].exclude_patterns == ()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "MACAM CORPORATION\nCHECK DATE: 07/16/2010\nSS# XXX-XX-4672 Y-T-D",
+        "Employee earnings statement for the pay period ending 3/1",
+        "Gross pay 1,200.00  Net pay 950.00",
+    ],
+)
+def test_paystub_content_is_detected(body):
+    assert textitems.content_looks_financial("0ST-1bsal", body) is not None

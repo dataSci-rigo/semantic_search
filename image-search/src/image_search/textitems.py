@@ -24,14 +24,20 @@ NOTE_EXTENSIONS = {".md", ".txt"}
 LINKS_EXTENSION = ".links"
 PDF_EXTENSION = ".pdf"
 DOCX_EXTENSION = ".docx"
+DOC_EXTENSION = ".doc"
+PPT_EXTENSION = ".ppt"
+PPTX_EXTENSION = ".pptx"
 CSV_EXTENSION = ".csv"
 XLSX_EXTENSION = ".xlsx"
 # suffix -> items.kind for one-file-one-item, content-addressed documents.
-# Legacy .doc/.xls (OLE binary) are deliberately absent — unsupported, and
-# their extensions never enter the walk.
+# Legacy .xls (OLE binary) is deliberately absent — unsupported, so its
+# extension never enters the walk.
 DOCUMENT_KINDS = {
     PDF_EXTENSION: "pdf",
     DOCX_EXTENSION: "docx",
+    DOC_EXTENSION: "doc",
+    PPTX_EXTENSION: "pptx",
+    PPT_EXTENSION: "ppt",
     CSV_EXTENSION: "csv",
     XLSX_EXTENSION: "xlsx",
 }
@@ -333,8 +339,11 @@ FINANCIAL_CONTENT_MARKERS = (
     "social security number", "taxable income", "year-end summary",
     "form 1099", "form w-2", "form 1040", "consolidated 1099",
     "designated bene plan", "brokerage account", "statement period",
+    # Paystubs/payroll exports — often named by employee code, not "paystub".
+    "net pay", "gross pay", "pay period", "check date", "earnings statement",
 )
-_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+# Full or masked ("XXX-XX-1234", as printed on paystubs) SSNs.
+_SSN_RE = re.compile(r"\b(?:\d{3}|[xX*]{3})-(?:\d{2}|[xX*]{2})-\d{4}\b")
 
 
 def looks_financial(path: Path) -> bool:
@@ -469,6 +478,183 @@ def parse_docx(path: Path) -> tuple[str, str]:
         except Exception:  # noqa: BLE001 - malformed metadata is common
             title = ""
     return title or path.stem, "\n".join(body_parts)[:DOC_BODY_CAP]
+
+
+def parse_pptx(path: Path) -> tuple[str, str]:
+    """(title, body) from a .pptx: slide text in order. Title is the
+    metadata title, else the first slide's title placeholder, else the
+    filename."""
+    from pptx import Presentation
+
+    prs = Presentation(str(path))
+    first_title = ""
+    parts: list[str] = []
+    length = 0
+    for slide in prs.slides:
+        if not first_title and slide.shapes.title is not None:
+            first_title = (slide.shapes.title.text or "").strip()
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            text = shape.text_frame.text.strip()
+            if text:
+                parts.append(text)
+                length += len(text) + 1
+        if length >= DOC_BODY_CAP:
+            break
+    try:
+        meta_title = (prs.core_properties.title or "").strip()
+    except Exception:  # noqa: BLE001 - malformed metadata is common
+        meta_title = ""
+    return meta_title or first_title or path.stem, "\n".join(parts)[:DOC_BODY_CAP]
+
+
+# Word/PowerPoint 97-2003 binaries are OLE compound files; olefile reads the
+# container and the parsers below follow the published formats ([MS-DOC],
+# [MS-PPT]) to where each keeps its text.
+_WORD_FIELD_BEGIN, _WORD_FIELD_SEP, _WORD_FIELD_END = "\x13", "\x14", "\x15"
+_CONTROL_TO_SPACE = {c: " " for c in range(32) if c not in (9, 10)}
+
+
+def _clean_office_text(text: str) -> str:
+    """Drop Word field codes (keep their displayed result), map paragraph,
+    cell and page marks to newlines, and blank other control characters."""
+    out: list[str] = []
+    depth = 0  # >0 while inside a field's instruction part
+    for ch in text:
+        if ch == _WORD_FIELD_BEGIN:
+            depth += 1
+        elif ch == _WORD_FIELD_SEP:
+            depth = max(0, depth - 1)
+        elif ch == _WORD_FIELD_END:
+            depth = max(0, depth - 1) if depth else 0
+        elif depth == 0:
+            out.append("\n" if ch in "\r\x07\x0b\x0c" else ch)
+    cleaned = "".join(out).translate(_CONTROL_TO_SPACE)
+    lines = (" ".join(line.split()) for line in cleaned.split("\n"))
+    return "\n".join(line for line in lines if line)
+
+
+def _word97_text(word: bytes, open_stream) -> str:
+    """Main-document text of a Word 97+ WordDocument stream via its piece
+    table ([MS-DOC] 2.4.1). `open_stream(name)` returns another stream of
+    the same file (the piece table lives in 0Table or 1Table)."""
+    import struct
+
+    u16 = lambda off: struct.unpack_from("<H", word, off)[0]  # noqa: E731
+    u32 = lambda off: struct.unpack_from("<I", word, off)[0]  # noqa: E731
+    magic = u16(0)
+    if magic not in (0xA5EC, 0xA5DC):
+        raise ValueError("not a Word binary document")
+    flags = u16(0x0A)
+    if flags & 0x0100:
+        raise ValueError("encrypted Word document")
+    if magic == 0xA5DC:  # Word 6/95: text stored contiguously, fcMin..fcMac
+        return word[u32(0x18):u32(0x1C)].decode("cp1252", errors="replace")
+    table = open_stream("1Table" if flags & 0x0200 else "0Table")
+    csw = u16(32)
+    rglw = 34 + csw * 2 + 2
+    cslw = u16(34 + csw * 2)
+    ccp_text = u32(rglw + 12)
+    blob = rglw + cslw * 4 + 2
+    fc_clx, lcb_clx = u32(blob + 33 * 8), u32(blob + 33 * 8 + 4)
+    clx = table[fc_clx:fc_clx + lcb_clx]
+    pos = 0
+    while pos < len(clx) and clx[pos] == 0x01:  # skip Prc entries
+        pos += 3 + struct.unpack_from("<H", clx, pos + 1)[0]
+    if pos >= len(clx) or clx[pos] != 0x02:
+        raise ValueError("Word piece table not found")
+    lcb = struct.unpack_from("<I", clx, pos + 1)[0]
+    plc = clx[pos + 5:pos + 5 + lcb]
+    n = (lcb - 4) // 12
+    cps = struct.unpack_from(f"<{n + 1}I", plc, 0)
+    parts: list[str] = []
+    for i in range(n):
+        start, end = cps[i], min(cps[i + 1], ccp_text)
+        if start >= end:
+            continue
+        fc_raw = struct.unpack_from("<I", plc, (n + 1) * 4 + i * 8 + 2)[0]
+        count = end - start
+        if fc_raw & 0x40000000:  # 8-bit text at fc/2
+            fc = (fc_raw & 0x3FFFFFFF) // 2
+            parts.append(word[fc:fc + count].decode("cp1252", errors="replace"))
+        else:
+            fc = fc_raw & 0x3FFFFFFF
+            parts.append(word[fc:fc + count * 2].decode("utf-16-le", errors="replace"))
+    return "".join(parts)
+
+
+def parse_doc(path: Path) -> tuple[str, str]:
+    """(title, body) from a legacy Word .doc; the title is the file name
+    (metadata titles in these files are mostly template leftovers, e.g.
+    another author's name). Files named .doc that are really RTF or
+    HTML/plain text (common on old drives) are read as such. Encrypted
+    documents raise, like password-protected PDFs."""
+    import olefile
+
+    if not olefile.isOleFile(str(path)):
+        data = path.read_bytes()
+        text = decode_text(data)
+        if data.lstrip().startswith(b"{\\rtf"):
+            text = _strip_rtf(text)
+        elif "<html" in text[:2000].lower():
+            text = re.sub(r"(?s)<(script|style).*?</\1>|<[^>]+>", " ", text)
+        return path.stem, _clean_office_text(text)[:DOC_BODY_CAP]
+    with olefile.OleFileIO(str(path)) as ole:
+        word = ole.openstream("WordDocument").read()
+        text = _word97_text(word, lambda name: ole.openstream(name).read())
+    return path.stem, _clean_office_text(text)[:DOC_BODY_CAP]
+
+
+def _strip_rtf(text: str) -> str:
+    """Crude RTF-to-text: enough for search, not for display."""
+    text = re.sub(r"\\'([0-9a-fA-F]{2})", lambda m: bytes([int(m.group(1), 16)]).decode("cp1252", "replace"), text)
+    text = re.sub(r"\\par[d]?\b|\\line\b", "\n", text)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?|\\[^a-zA-Z]", "", text)
+    return text.replace("{", "").replace("}", "")
+
+
+_PPT_TEXT_CHARS = 0x0FA0  # TextCharsAtom: UTF-16LE
+_PPT_TEXT_BYTES = 0x0FA8  # TextBytesAtom: low bytes of UTF-16 (Latin-1)
+
+
+def _ppt_text(stream: bytes) -> list[str]:
+    """Text atoms of a 'PowerPoint Document' stream, in stream order
+    ([MS-PPT] records: 8-byte header; recVer 0xF marks a container)."""
+    import struct
+
+    out: list[str] = []
+    stack = [(0, len(stream))]
+    while stack:
+        off, end = stack.pop()
+        while off + 8 <= end:
+            ver_inst, rtype, rlen = struct.unpack_from("<HHI", stream, off)
+            body = off + 8
+            if body + rlen > end:
+                break
+            if ver_inst & 0x000F == 0x000F:
+                stack.append((off + 8 + rlen, end))  # resume after the container
+                off, end = body, body + rlen
+                continue
+            if rtype == _PPT_TEXT_CHARS:
+                out.append(stream[body:body + rlen].decode("utf-16-le", errors="replace"))
+            elif rtype == _PPT_TEXT_BYTES:
+                out.append(stream[body:body + rlen].decode("latin-1"))
+            off = body + rlen
+    return [t for t in out if t.strip() and not t.startswith("Click to edit Master")]
+
+
+def parse_ppt(path: Path) -> tuple[str, str]:
+    """(title, body) from a legacy PowerPoint .ppt; the title is the deck's
+    first line of text (usually the title slide), else the file name —
+    metadata titles here are mostly "PowerPoint Presentation"."""
+    import olefile
+
+    with olefile.OleFileIO(str(path)) as ole:
+        texts = _ppt_text(ole.openstream("PowerPoint Document").read())
+    body = _clean_office_text("\n".join(texts))
+    first_line = body.split("\n", 1)[0] if body else ""
+    return first_line[:120] or path.stem, body[:DOC_BODY_CAP]
 
 
 def parse_csv(path: Path) -> tuple[str, str]:
