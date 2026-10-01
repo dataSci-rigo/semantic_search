@@ -79,12 +79,22 @@ def ingest_folder(
 
         try:
             suffix = path.suffix.lower()
-            if suffix in textitems.NOTE_EXTENSIONS or suffix in folder.text_exts:
+            if suffix in textitems.HTML_EXTENSIONS and path.name.lower() in textitems.BOOKMARK_FILENAMES:
+                indexed = _ingest_bookmarks(conn, registry, folder, folder_key, path, mtime)
+            elif (
+                suffix in textitems.NOTE_EXTENSIONS
+                or suffix in textitems.HTML_EXTENSIONS
+                or suffix in textitems.DOC_EXTENSIONS
+                or path.name.lower() == textitems.TASKS_FILENAME
+                or suffix in folder.text_exts
+            ):
                 indexed = _ingest_note(conn, registry, folder, folder_key, path, mtime)
             elif suffix == textitems.LINKS_EXTENSION:
                 indexed = _ingest_links(conn, registry, folder, folder_key, path, mtime)
             elif suffix == textitems.PDF_EXTENSION:
                 indexed = _ingest_pdf(conn, registry, folder, folder_key, path, mtime)
+            elif suffix in images_store.VIDEO_EXTENSIONS:
+                indexed = _ingest_video(conn, registry, folder, folder_key, path, mtime)
             elif not _wants_images(folder, path):
                 # A documents/code folder with no image processors: images in
                 # its tree would index as empty, unfindable rows — skip them.
@@ -114,12 +124,18 @@ def ingest_folder(
 
 
 def _ingest_phase(folder: FolderConfig, path: Path) -> int:
-    """0 = caption-pipeline image (GPU-heavy caption worker), 1 = everything
-    else. Non-image files are all phase 1 — notes/links are cheap, and PDFs
-    use the OCR worker, so they belong with the OCR phase."""
+    """-1 = videos (metadata-only, no GPU — done first so a multi-day caption
+    marathon doesn't delay them), 0 = caption-pipeline image (GPU-heavy
+    caption worker), 1 = everything else. Notes/links are cheap, and PDFs use
+    the OCR worker, so they belong with the OCR phase."""
     suffix = path.suffix.lower()
+    if suffix in images_store.VIDEO_EXTENSIONS:
+        return -1
     if (
         suffix in textitems.NOTE_EXTENSIONS
+        or suffix in textitems.HTML_EXTENSIONS
+        or suffix in textitems.DOC_EXTENSIONS
+        or path.name.lower() == textitems.TASKS_FILENAME
         or suffix in folder.text_exts
         or suffix in (textitems.LINKS_EXTENSION, textitems.PDF_EXTENSION)
     ):
@@ -226,6 +242,94 @@ def _ingest_links(
             logger.info("link %s: %s (kept, excluded from search)", url, status)
     conn.commit()
     return added > 0 or bool(previous_ids - current_ids)
+
+
+def _ingest_bookmarks(
+    conn: sqlite3.Connection,
+    registry: Registry,
+    folder: FolderConfig,
+    folder_key: str,
+    path: Path,
+    mtime: float,
+) -> bool:
+    """A browser bookmarks export: one link item per URL. Each new URL's page
+    is fetched once and its TEXT body indexed (fetch_page strips markup;
+    images are never downloaded) — dead/thin pages are kept with a non-ok
+    status, which excludes them from search but avoids refetching every run.
+    Diffed like .links files: URLs that left the export are purged."""
+    path_str = str(path)
+    images_store.upsert_file(
+        conn, path_str, folder_key, images_store.content_hash(path), mtime
+    )
+    bookmarks = textitems.parse_bookmarks(path)
+    current_ids = {textitems.link_id(url) for url, _ in bookmarks}
+    previous_ids = {
+        r["id"]
+        for r in conn.execute("SELECT id FROM items WHERE src_path = ?", (path_str,))
+    }
+    for stale in previous_ids - current_ids:
+        images_store.purge_item(conn, stale)
+
+    embedder = _text_embedder(registry, folder, path)
+    added = 0
+    for url, title in bookmarks:
+        item_id = textitems.link_id(url)
+        if item_id in previous_ids:
+            continue
+        if conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
+            continue  # same URL already indexed from a .links file or another export
+        fetched_title, page_text, status = textitems.fetch_page(url)
+        body = "\n".join(part for part in (title, page_text) if part)
+        textitems.insert_item(
+            conn,
+            item_id=item_id,
+            kind="link",
+            folder=folder_key,
+            src_path=path_str,
+            title=fetched_title or title,
+            url=url,
+            body=body,
+            text_embedder=embedder,
+            status=status,
+        )
+        previous_ids.add(item_id)
+        added += 1
+        if added % 25 == 0:
+            conn.commit()  # long fetch runs shouldn't lose everything on a crash
+    conn.commit()
+    return added > 0
+
+
+def _ingest_video(
+    conn: sqlite3.Connection,
+    registry: Registry,
+    folder: FolderConfig,
+    folder_key: str,
+    path: Path,
+    mtime: float,
+) -> bool:
+    """Metadata-only video item (tier 0): filename, duration, dates, and any
+    Takeout sidecar text become searchable; no frame or audio analysis."""
+    item_id = images_store.content_hash(path)
+    images_store.upsert_file(conn, str(path), folder_key, item_id, mtime)
+    if conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
+        conn.commit()
+        return False
+    sidecar = textitems.takeout_sidecar(path)
+    body = textitems.video_body(path, textitems.probe_video(path), sidecar)
+    textitems.insert_item(
+        conn,
+        item_id=item_id,
+        kind="video",
+        folder=folder_key,
+        src_path=str(path),
+        title=sidecar.get("title") or path.stem,
+        url=None,
+        body=body,
+        text_embedder=_text_embedder(registry, folder, path),
+    )
+    conn.commit()
+    return True
 
 
 def _ingest_pdf(

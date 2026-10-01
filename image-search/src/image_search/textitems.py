@@ -20,8 +20,20 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 NOTE_EXTENSIONS = {".md", ".txt"}
+# Local saved pages / exported notes (e.g. Google Keep's per-note .html in a
+# Takeout vault) — text is extracted with the same parser fetch_page uses.
+HTML_EXTENSIONS = {".html", ".htm"}
+# Browser bookmark exports (Netscape format): each <a href> becomes its own
+# link item, WITHOUT fetching the page — an export can hold thousands of URLs.
+BOOKMARK_FILENAMES = {"bookmarks.html", "reading list.html"}
 LINKS_EXTENSION = ".links"
 PDF_EXTENSION = ".pdf"
+# Word documents: .docx is unzipped and parsed with the stdlib; legacy .doc
+# goes through headless LibreOffice (the only reliable .doc reader here).
+DOC_EXTENSIONS = {".doc", ".docx"}
+# Google Takeout task exports, matched by exact filename (a bare ".json"
+# rule would swallow every Takeout photo sidecar).
+TASKS_FILENAME = "tasks.json"
 
 # Chunked embedding: bge-small truncates around 512 tokens (~2,000 chars), so
 # a whole document in one vector loses everything past its opening — measured
@@ -159,7 +171,14 @@ def is_fetchable(url: str) -> tuple[bool, str]:
 
 def parse_note(path: Path) -> tuple[str, str]:
     """(title, body): title is the first markdown heading, else the first
-    non-empty line."""
+    non-empty line. HTML, Word, and Tasks.json files route to their own
+    parsers."""
+    if path.name.lower() == TASKS_FILENAME:
+        return parse_tasks_json(path)
+    if path.suffix.lower() in HTML_EXTENSIONS:
+        return parse_html_note(path)
+    if path.suffix.lower() in DOC_EXTENSIONS:
+        return parse_doc(path)
     body = path.read_text(errors="replace")
     title = ""
     for line in body.splitlines():
@@ -423,6 +442,215 @@ def _ocr_pdf_pages(path: Path, page_indexes: list[int], ocr_processor) -> list[s
             except Exception:  # noqa: BLE001 - a page that won't render is skipped
                 continue
     return out
+
+
+def parse_html_note(path: Path) -> tuple[str, str]:
+    """(title, cleaned text) from a local HTML file — a saved page or an
+    exported note (Google Keep). Same extractor fetch_page uses, plus
+    whitespace cleanup: runs of blank lines/spaces collapse so navigation
+    soup doesn't bloat the stored body or dilute its chunk embeddings."""
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(path.read_text(errors="replace"))
+    except Exception:
+        return path.stem, ""
+    title = " ".join("".join(extractor.title_parts).split()) or path.stem
+    lines = ("".join(extractor.text_parts)).splitlines()
+    cleaned: list[str] = []
+    blank = False
+    for line in lines:
+        line = " ".join(line.split())
+        if line:
+            cleaned.append(line)
+            blank = False
+        elif not blank:
+            cleaned.append("")
+            blank = True
+    return title, "\n".join(cleaned).strip()
+
+
+class _BookmarkExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []  # (url, title)
+        self._href: str | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href:
+            if self._href.startswith(("http://", "https://")):
+                title = " ".join("".join(self._text).split())
+                self.links.append((self._href, title or self._href))
+            self._href = None
+
+
+def parse_bookmarks(path: Path) -> list[tuple[str, str]]:
+    """[(url, title)] from a Netscape-format bookmarks export."""
+    extractor = _BookmarkExtractor()
+    extractor.feed(path.read_text(errors="replace"))
+    return extractor.links
+
+
+def parse_docx(path: Path) -> str:
+    """Text of a .docx via the stdlib: it's a zip whose word/document.xml
+    holds the text; paragraph closes become newlines, tags are stripped."""
+    import html as _html
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8", errors="replace")
+    xml = xml.replace("</w:p>", "\n").replace("<w:tab/>", "\t")
+    text = re.sub(r"<[^>]+>", "", xml)
+    return _html.unescape(text).strip()
+
+
+def parse_doc(path: Path) -> tuple[str, str]:
+    """(title, body) for Word files. Legacy .doc converts through headless
+    LibreOffice with an isolated profile (so a running LibreOffice or a
+    parallel worker can't deadlock on the shared profile lock). Unreadable
+    files come back with an empty body — indexed by filename, never fatal."""
+    import subprocess
+    import tempfile
+
+    import shutil
+
+    body = ""
+    try:
+        if path.suffix.lower() == ".docx":
+            body = parse_docx(path)
+        elif shutil.which("antiword"):
+            out = subprocess.run(
+                ["antiword", str(path)], capture_output=True, text=True, timeout=60
+            )
+            body = out.stdout.strip()
+        if not body and path.suffix.lower() == ".doc" and shutil.which("soffice"):
+            with tempfile.TemporaryDirectory(prefix="imgsearch_doc") as tmp:
+                subprocess.run(
+                    ["soffice", "--headless",
+                     f"-env:UserInstallation=file://{tmp}/lo",
+                     "--convert-to", "txt:Text", "--outdir", tmp, str(path)],
+                    capture_output=True, timeout=60,
+                )
+                out_file = Path(tmp) / (path.stem + ".txt")
+                if out_file.exists():
+                    body = out_file.read_text(errors="replace").strip()
+    except Exception:
+        body = ""
+    title = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+    return (title[:120] or path.stem), body
+
+
+def parse_tasks_json(path: Path) -> tuple[str, str]:
+    """(title, body) for a Google Takeout Tasks.json: every task list becomes
+    a heading, every task a line with its status (and notes/due when set)."""
+    import json as _json
+
+    try:
+        data = _json.loads(path.read_text(errors="replace"))
+    except Exception:
+        return path.stem, ""
+    lines: list[str] = []
+    for task_list in data.get("items", []):
+        lines.append(f"# {task_list.get('title', 'Tasks')}")
+        for task in task_list.get("items", []):
+            mark = "x" if task.get("status") == "completed" else " "
+            line = f"- [{mark}] {task.get('title', '').strip()}"
+            if task.get("due"):
+                line += f" (due {task['due'][:10]})"
+            lines.append(line)
+            if task.get("notes"):
+                lines.append(f"  {' '.join(task['notes'].split())}")
+        lines.append("")
+    return "Google Tasks", "\n".join(lines).strip()
+
+
+def probe_video(path: Path) -> dict:
+    """Duration/resolution/creation date via ffprobe. Empty dict when ffprobe
+    is missing or the file is unreadable — metadata indexing must never make
+    a video fail ingest."""
+    import json as _json
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = _json.loads(out.stdout or "{}")
+    except Exception:
+        return {}
+    meta: dict = {}
+    fmt = data.get("format", {})
+    if fmt.get("duration"):
+        meta["duration_s"] = float(fmt["duration"])
+    created = fmt.get("tags", {}).get("creation_time")
+    if created:
+        meta["created"] = created[:10]
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video" and stream.get("width"):
+            meta["resolution"] = f'{stream["width"]}x{stream["height"]}'
+            break
+    return meta
+
+
+def takeout_sidecar(path: Path) -> dict:
+    """Google Takeout metadata for a media file, from the .json sidecar next
+    to it (title, description, taken-time, GPS). Empty dict when absent."""
+    import json as _json
+
+    for cand in (
+        path.parent / f"{path.name}.json",
+        path.parent / f"{path.name}.supplemental-metadata.json",
+        path.parent / f"{path.stem}.json",
+    ):
+        if not cand.exists():
+            continue
+        try:
+            data = _json.loads(cand.read_text(errors="replace"))
+        except Exception:
+            continue
+        meta: dict = {}
+        if data.get("title"):
+            meta["title"] = data["title"]
+        if data.get("description"):
+            meta["description"] = data["description"]
+        taken = (data.get("photoTakenTime") or {}).get("formatted")
+        if taken:
+            meta["taken"] = taken
+        geo = data.get("geoData") or {}
+        if geo.get("latitude"):
+            meta["location"] = f'{geo["latitude"]:.4f},{geo["longitude"]:.4f}'
+        return meta
+    return {}
+
+
+def video_body(path: Path, probe: dict, sidecar: dict) -> str:
+    """Searchable text for a metadata-only video item."""
+    parts = [f"video {path.name}"]
+    if probe.get("duration_s") is not None:
+        m, s = divmod(int(probe["duration_s"]), 60)
+        parts.append(f"duration {m}m{s:02d}s")
+    if probe.get("resolution"):
+        parts.append(probe["resolution"])
+    if probe.get("created"):
+        parts.append(f"recorded {probe['created']}")
+    if sidecar.get("taken"):
+        parts.append(f"taken {sidecar['taken']}")
+    if sidecar.get("location"):
+        parts.append(f"location {sidecar['location']}")
+    if sidecar.get("description"):
+        parts.append(sidecar["description"])
+    return "\n".join(parts)
 
 
 def _searchable_text(title: str, url: str | None, body: str) -> str:

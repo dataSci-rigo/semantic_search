@@ -30,6 +30,9 @@ class DiscoveredImage:
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"}
+# Indexed as metadata-only "video" items (duration/dates/sidecar text — no
+# frame or audio analysis yet; that's the keyframe/whisper tiers).
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".3gp", ".wmv", ".m4v"}
 
 
 def walk_candidates(
@@ -43,10 +46,19 @@ def walk_candidates(
     hashes only paths whose mtime changed."""
     import os
 
-    from image_search.textitems import LINKS_EXTENSION, NOTE_EXTENSIONS, PDF_EXTENSION
+    from image_search.textitems import (
+        DOC_EXTENSIONS,
+        HTML_EXTENSIONS,
+        LINKS_EXTENSION,
+        NOTE_EXTENSIONS,
+        PDF_EXTENSION,
+        TASKS_FILENAME,
+    )
 
-    extensions = IMAGE_EXTENSIONS | NOTE_EXTENSIONS | {LINKS_EXTENSION, PDF_EXTENSION}
+    extensions = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | NOTE_EXTENSIONS | HTML_EXTENSIONS
+    extensions |= DOC_EXTENSIONS | {LINKS_EXTENSION, PDF_EXTENSION}
     extensions |= {ext.lower() for ext in extra_extensions}
+    special_names = {TASKS_FILENAME}
     skips = set(skip_dirs)
     out: list[tuple[Path, float]] = []
     if not folder_path.exists():
@@ -55,7 +67,10 @@ def walk_candidates(
         dirnames[:] = sorted(d for d in dirnames if d not in skips)
         for name in sorted(filenames):
             path = Path(dirpath) / name
-            if path.suffix.lower() not in extensions or not path.is_file():
+            if (
+                path.suffix.lower() not in extensions
+                and name.lower() not in special_names
+            ) or not path.is_file():
                 continue
             out.append((path, path.stat().st_mtime))
     return sorted(out)

@@ -32,11 +32,20 @@ folders:
     image_embed: off
     skip_dirs: [".git", "__pycache__", "shell-snapshots", "todos", "statsig",
                 "downloads", "file-history", "session-env", "ide"]
-  # Takeout products other than Google Photos (GoogleVault lives under
-  # ~/Documents and is covered by that folder).
+  # Takeout products other than Google Photos.
   "~/takeout_other":
     caption: off
     image_embed: off
+  # Per-account Google exports (keep/chrome/drive/...): Keep notes and saved
+  # pages ingest as HTML notes, Bookmarks.html / Reading List.html as per-URL
+  # link items, PDFs sampled (financial gate applies), school code via
+  # text_exts. Mail (.mbox), Tasks.json and calendar .ics need parsers of
+  # their own — not yet ingested.
+  "~/GoogleVault":
+    caption: off
+    image_embed: off
+    text_exts: [".py", ".rb", ".cc", ".c", ".h", ".java", ".js", ".sh", ".sql"]
+    skip_dirs: [".git", "__pycache__", "node_modules"]
 
   # Whole photo library. Nested "Screenshots" dirs (there are several,
   # scattered under dw2/, pix3/, pix3/Pictures/, and the top-level one) get

@@ -280,3 +280,228 @@ def test_long_note_gets_chunk_vectors_and_one_search_hit(tmp_path):
     ingest_folder(conn, config, registry, str(folder))
     left = conn.execute("SELECT COUNT(*) AS n FROM vec_map").fetchone()["n"]
     assert left == 0
+
+
+# ---- tier-0 video metadata items -------------------------------------------
+
+
+def _video_setup(tmp_path, video_bytes=b"not really a video"):
+    from image_search.config import load_config
+    from image_search.registry import Registry
+    from image_search.store.db import connect, migrate
+
+    folder = tmp_path / "vids"
+    folder.mkdir()
+    video = folder / "VID_20190704_beach.mp4"
+    video.write_bytes(video_bytes)
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(f'folders:\n  "{folder}":\n    ocr: fake-ocr\n')
+    config = load_config(config_path)
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    return folder, video, config, Registry(config), conn
+
+
+def test_video_indexed_with_sidecar_metadata(tmp_path):
+    import json
+
+    from image_search.ingest import ingest_folder
+    from image_search.search import search_text
+
+    folder, video, config, registry, conn = _video_setup(tmp_path)
+    (folder / "VID_20190704_beach.mp4.json").write_text(json.dumps({
+        "title": "Fourth of July fireworks",
+        "description": "fireworks over the lake with the kids",
+        "photoTakenTime": {"formatted": "Jul 4, 2019, 9:12:33 PM UTC"},
+        "geoData": {"latitude": 34.05, "longitude": -118.24},
+    }))
+
+    stats = ingest_folder(conn, config, registry, str(folder))
+    assert stats["indexed"] >= 1
+    row = conn.execute("SELECT * FROM items WHERE kind='video'").fetchone()
+    assert row["title"] == "Fourth of July fireworks"
+    assert "fireworks over the lake" in row["body"]
+    assert "34.0500" in row["body"]
+
+    hits = search_text(conn, config, registry, str(folder), "fireworks")
+    assert any(h.kind == "video" for h in hits)
+
+
+def test_unreadable_video_still_indexes_by_name(tmp_path):
+    from image_search.ingest import ingest_folder
+
+    folder, video, config, registry, conn = _video_setup(tmp_path)
+    stats = ingest_folder(conn, config, registry, str(folder))
+    assert stats["failed"] == 0
+    row = conn.execute("SELECT * FROM items WHERE kind='video'").fetchone()
+    assert row["title"] == "VID_20190704_beach"
+    assert "VID_20190704_beach.mp4" in row["body"]
+
+
+def test_real_video_gets_duration_and_resolution(tmp_path):
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    from image_search.ingest import ingest_folder
+
+    folder, video, config, registry, conn = _video_setup(tmp_path)
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+         "testsrc=duration=2:size=320x240:rate=5", str(video)],
+        check=True,
+    )
+    ingest_folder(conn, config, registry, str(folder))
+    row = conn.execute("SELECT body FROM items WHERE kind='video'").fetchone()
+    assert "duration 0m02s" in row["body"]
+    assert "320x240" in row["body"]
+
+
+# ---- HTML notes (Keep exports, saved pages) and bookmark files -------------
+
+
+def test_parse_html_note_cleans_and_titles(tmp_path):
+    from image_search.textitems import parse_html_note
+
+    page = tmp_path / "API Plant life.html"
+    page.write_text(
+        "<html><head><title>API   Plant life</title>"
+        "<script>var junk = 'never index me';</script>"
+        "<style>.x{color:red}</style></head>"
+        "<body><p>Water the   monstera weekly.</p>\n\n\n\n"
+        "<p>Perenual API key is in the env.</p></body></html>"
+    )
+    title, body = parse_html_note(page)
+    assert title == "API Plant life"
+    assert "monstera weekly" in body and "Perenual API" in body
+    assert "junk" not in body and "color:red" not in body
+    assert "\n\n\n" not in body  # blank runs collapsed
+
+
+def test_bookmarks_file_becomes_link_items_with_fetched_text(tmp_path, monkeypatch):
+    from image_search import textitems
+    from image_search.config import load_config
+    from image_search.ingest import ingest_folder
+    from image_search.registry import Registry
+    from image_search.search import search_text
+    from image_search.store.db import connect, migrate
+
+    # Pages are fetched for their text body (never real network in tests).
+    fetched: list[str] = []
+
+    def fake_fetch(url):
+        fetched.append(url)
+        return None, f"page text body for {url}", textitems.STATUS_OK
+
+    monkeypatch.setattr(textitems, "fetch_page", fake_fetch)
+
+    folder = tmp_path / "vault"
+    folder.mkdir()
+    (folder / "Bookmarks.html").write_text(
+        '<DL><DT><A HREF="https://sqlite.org/vec.html" ADD_DATE="1">sqlite-vec docs</A>'
+        '<DT><A HREF="https://example.com/rl">Omaha RL notes</A>'
+        '<DT><A HREF="javascript:void(0)">junk pseudo-link</A></DL>'
+    )
+    config_path = tmp_path / "folders.yaml"
+    config_path.write_text(f'folders:\n  "{folder}":\n    ocr: fake-ocr\n')
+    config = load_config(config_path)
+    registry = Registry(config)
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+
+    ingest_folder(conn, config, registry, str(folder))
+    rows = conn.execute("SELECT * FROM items WHERE kind='link' ORDER BY title").fetchall()
+    assert [r["title"] for r in rows] == ["Omaha RL notes", "sqlite-vec docs"]
+    assert rows[1]["url"] == "https://sqlite.org/vec.html"
+    # The javascript: pseudo-link was never fetched; real URLs were, and the
+    # page text landed in the searchable body.
+    assert sorted(fetched) == ["https://example.com/rl", "https://sqlite.org/vec.html"]
+    assert "page text body for https://sqlite.org/vec.html" in rows[1]["body"]
+
+    hits = search_text(conn, config, registry, str(folder), "sqlite-vec")
+    assert any(h.url == "https://sqlite.org/vec.html" for h in hits)
+
+    # Removing a bookmark from the export purges its item on rescan.
+    (folder / "Bookmarks.html").write_text(
+        '<DL><DT><A HREF="https://sqlite.org/vec.html">sqlite-vec docs</A></DL>'
+    )
+    ingest_folder(conn, config, registry, str(folder))
+    left = conn.execute("SELECT title FROM items WHERE kind='link'").fetchall()
+    assert [r["title"] for r in left] == ["sqlite-vec docs"]
+
+
+# ---- Word documents and Google Tasks exports -------------------------------
+
+
+def test_parse_docx_extracts_paragraph_text(tmp_path):
+    import zipfile
+
+    from image_search.textitems import parse_doc
+
+    docx = tmp_path / "cover letter.docx"
+    xml = (
+        '<?xml version="1.0"?><w:document xmlns:w="ns"><w:body>'
+        "<w:p><w:r><w:t>To Whom It May Concern</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>I am writing about the R&amp;D role.</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    )
+    with zipfile.ZipFile(docx, "w") as zf:
+        zf.writestr("word/document.xml", xml)
+    title, body = parse_doc(docx)
+    assert title == "To Whom It May Concern"
+    assert "R&D role" in body
+    assert "<w:" not in body
+
+
+def test_parse_doc_legacy_via_converter(tmp_path):
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if not shutil.which("soffice"):
+        pytest.skip("LibreOffice not installed")
+    from image_search.textitems import parse_doc
+
+    src = tmp_path / "notes.txt"
+    src.write_text("Thesis meeting notes\nDiscussed adaptive filters.")
+    subprocess.run(
+        ["soffice", "--headless", f"-env:UserInstallation=file://{tmp_path}/lo",
+         "--convert-to", "doc", "--outdir", str(tmp_path), str(src)],
+        capture_output=True, timeout=120,
+    )
+    if not (tmp_path / "notes.doc").exists():
+        # soffice present but non-functional (e.g. libreoffice-writer not
+        # installed) — parse_doc's empty-body fallback covers production.
+        pytest.skip("soffice cannot convert on this machine")
+    title, body = parse_doc(tmp_path / "notes.doc")
+    assert "adaptive filters" in body.lower()
+
+
+def test_tasks_json_parses_lists_and_status(tmp_path):
+    import json
+
+    from image_search.textitems import parse_note
+
+    tasks = tmp_path / "Tasks.json"
+    tasks.write_text(json.dumps({
+        "kind": "tasks#taskLists",
+        "items": [{
+            "title": "House",
+            "items": [
+                {"title": "fix the gate", "status": "needsAction",
+                 "due": "2026-10-01T00:00:00.000Z"},
+                {"title": "buy paint", "status": "completed",
+                 "notes": "behr  ultra,  eggshell"},
+            ],
+        }],
+    }))
+    title, body = parse_note(tasks)
+    assert title == "Google Tasks"
+    assert "# House" in body
+    assert "- [ ] fix the gate (due 2026-10-01)" in body
+    assert "- [x] buy paint" in body
+    assert "behr ultra, eggshell" in body
